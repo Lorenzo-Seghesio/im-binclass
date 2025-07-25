@@ -6,3 +6,4 @@ matplotlib
 plotly
 optuna
 pyarrow
+PyQt6
