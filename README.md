@@ -14,4 +14,4 @@ The argument `arg1` can be:
 - `--first_data_full` - to use the first dataset with machine parameters and sensor measurements
 - `--pp_data` - to use new dataset with only PP material data
 - `--abs_data` - to use new dataset with only ABS material data
-- If I leave `arg1` empty then by default the code uses the new dataset with both PP and ABS data 
+- If `arg1` is not used then by default the code uses the new dataset with both PP and ABS data 
