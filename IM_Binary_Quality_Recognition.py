@@ -1,3 +1,8 @@
+# IM_Binary_Quality_Recognition.py
+#
+# This code is part of a machine learning project for binary classification using MLPs with hyperparameter optimization (HPO) and pruning techniques.
+# It includes model definition, training, evaluation, and visualization of results.
+
 import pandas as pd
 import numpy as np
 import torch
@@ -411,10 +416,10 @@ if __name__ == "__main__":
     start_time = time.time()
     # Argument parser
     parser = argparse.ArgumentParser(description="Train a binary classification model.")
-    parser.add_argument('--first_data', action='store_true', help="Decice whether to use first dataset, if selected only the first dataset will be used")
-    parser.add_argument('--first_data_full', action='store_true', help="Decice whether to use first dataset with also measurments, if selected only the first dataset with measurment will be used")
-    parser.add_argument('--pp_data', action='store_true', help="Decice whether to use PP dataset, can be used together with ABS dataset")
-    parser.add_argument('--abs_data', action='store_true', help="Decice whether to use the ABS dataset, can be used together with PP dataset")
+    parser.add_argument('--first_data', action='store_true', help="Decide whether to use first dataset, if selected only the first dataset will be used")
+    parser.add_argument('--first_data_full', action='store_true', help="Decide whether to use first dataset with also measurements, if selected only the first dataset with measurement will be used")
+    parser.add_argument('--pp_data', action='store_true', help="Decide whether to use PP dataset, can be used together with ABS dataset")
+    parser.add_argument('--abs_data', action='store_true', help="Decide whether to use the ABS dataset, can be used together with PP dataset")
     args = parser.parse_args()
     # Load data path
     if args.first_data:
@@ -454,108 +459,3 @@ if __name__ == "__main__":
     # Print total time taken
     end_time = time.time()
     print(f"\nTotal time taken: {end_time - start_time:.2f} seconds")
-
-
-
-
-
-
-###### OLD VERSION OF THE CODE, NOT USED ANYMORE, BUT KEPT FOR REFERENCE
-# # === Retrain Final Model ===
-# def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/DATA_ABS_&_PP_Binary.csv', save_path="models/best_model_AUC.pt"):
-#     global best_model_global
-#     global batch_size
-#     global dropout
-
-#     # batch_size = params["batch_size"]
-#     # dropout = params["dropout"]
-
-#     print(f"\nTraining the best model...")
-
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-#     X, y = load_dataset(csv_path)
-#     print(f"The Data has {X.shape[0]} samples and {X.shape[1]} features.")
-
-#     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-#     # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-
-#     # train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
-#     #                          torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
-#     # val_ds = TensorDataset(torch.tensor(X_test, dtype=torch.float32),
-#     #                            torch.tensor(y_test, dtype=torch.float32).unsqueeze(1))
-#     # train_loader = DataLoader(train_ds, batch_size=params["batch_size"], shuffle=True)
-#     # val_loader = DataLoader(val_ds, batch_size=params["batch_size"])
-
-#     batch_size = 32
-#     dropout = 0.0
-#     model = BinaryClassifier(input_size=X.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
-#     criterion = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
-#     optimizer = torch.optim.Adam(model.parameters(), lr=params_tpe["lr"])
-
-#     auc_scores = []
-#     best_auc = 0
-#     best_model = None
-
-#     for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-#         X_train, X_val = X[train_idx], X[val_idx]
-#         y_train, y_val = y[train_idx], y[val_idx]
-
-#         train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
-#                                  torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
-#         val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
-#                                torch.tensor(y_val, dtype=torch.float32).unsqueeze(1))
-
-#         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-#         val_loader = DataLoader(val_ds, batch_size=batch_size)
-
-#         # Train
-#         model = train_one_fold(model, train_loader, val_loader, device, criterion, optimizer)
-
-#         # Evaluate
-#         auc_score = evaluate_model(model, val_loader, device, 'auc')
-#         auc_scores.append(auc_score)
-
-#         if auc_score > best_auc:
-#             best_auc = auc_score
-#             best_model = model
-#             X_test, y_test = X_val, y_val  # Save the test set for final evaluation
-    
-#     print(f"Best AUC Score across folds: {best_auc:.4f} and mean AUC Score: {np.mean(auc_scores):.4f}, after {len(auc_scores)} folds.")
-    
-#     # model = train_one_fold(model, train_loader, val_loader, device, criterion, optimizer)
-
-#     # early_stopping = EarlyStopping(patience=25)
-#     # for epoch in range(epochs):
-#     #     model.train()
-#     #     for xb, yb in train_loader:
-#     #         xb, yb = xb.to(device), yb.to(device)
-#     #         optimizer.zero_grad()
-#     #         loss = criterion(model(xb), yb)
-#     #         loss.backward()
-#     #         optimizer.step()
-
-#     #     model.eval()
-#     #     with torch.no_grad():
-#     #         outputs = model(torch.tensor(X_test, dtype=torch.float32).to(device))
-#     #         prods = (torch.sigmoid(outputs)).float().cpu().numpy()
-#     #     auc_score = roc_auc_score(y_test, prods)
-#     #     # loss = criterion(outputs, torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device))
-#     #     early_stopping(auc_score, model)
-#     #     if early_stopping.early_stop:
-#     #         print(f"Early stopping at epoch {epoch + 1} with AUC Score: {auc_score:.4f}")
-#     #         break
-#     # model.load_state_dict(early_stopping.best_model_state)
-
-#     torch.save(best_model.state_dict(), save_path)
-
-#     # Model evaluation
-#     print(f"\nRe-trained model evaluation")
-#     evaluate_and_plot_results(best_model, X_test, y_test, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
-
-#     # ---- This makes no sense because this model has probably been trianed on some of the data that now is used for evaluation ----
-#     # Load and evaluate best model trained with Optuna
-#     # print(f"\nModel trained by otpuna evaluation")
-#     # print(f"Optuna model architecture: {best_model_global}")
-#     # evaluate_and_plot_results(best_model_global, X_test, y_test, device=device, save_path="images/test_results_AUC_optuna.png", roc_curve_path="images/auc_opt_roc_curve_optuna.png")

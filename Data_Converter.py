@@ -1,3 +1,7 @@
+# Data_Converter.py
+#
+# This script converts a Parquet dataset to a CSV file.
+
 import pandas as pd
 
 df = pd.read_parquet('data/dataset.parquet')
