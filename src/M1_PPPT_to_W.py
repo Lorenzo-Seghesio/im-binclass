@@ -42,6 +42,7 @@ Outputs
 """
 
 import argparse
+from datetime import datetime
 import copy, json, math, shutil, warnings
 import optuna
 import numpy as np
@@ -60,6 +61,7 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+_RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 # ── Model definition ──────────────────────────────────────────────────────────
 
@@ -901,7 +903,7 @@ def main():
     print(f"Config   : {cfg_path}")
 
     out_dir          = BASE_DIR / out_cfg["output_dir"]
-    run_best_dir     = BASE_DIR / out_cfg["run_best_dir"]
+    run_best_dir     = BASE_DIR / out_cfg["run_best_dir"] / _RUN_TS
     overall_best_dir = BASE_DIR / out_cfg["best_overall_dir"]
     for d in [out_dir, run_best_dir, overall_best_dir]:
         d.mkdir(parents=True, exist_ok=True)

@@ -37,6 +37,7 @@ Outputs
 """
 
 import argparse
+from datetime import datetime
 import copy, json, math, shutil, warnings
 import joblib
 import optuna
@@ -59,6 +60,7 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 BASE_OUT = BASE_DIR / "outputs" / "RefModels"
+_RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 _CFG_MAP = {
     "PP":  "RefModels_PP_config.json",
@@ -895,7 +897,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray):
     hpo_cfg   = cfg["encoder_hpo"]
     train_cfg = cfg["training"].copy()
-    rb_dir    = BASE_OUT / "Encoder" / mat_dir / "run_best"
+    rb_dir    = BASE_OUT / "Encoder" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "Encoder" / mat_dir / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -970,7 +972,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
             dev_idx: np.ndarray, test_idx: np.ndarray):
     hpo_cfg   = cfg["mlp_hpo"]
     train_cfg = cfg["training"].copy()
-    rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best"
+    rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "MLP" / mat_dir / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1041,7 +1043,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
              dev_idx: np.ndarray, test_idx: np.ndarray):
     hpo_cfg   = cfg["lgbm_hpo"]
     train_cfg = cfg["training"]
-    rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best"
+    rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "LightGBM" / mat_dir / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1105,7 +1107,7 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray):
     hpo_cfg   = cfg["xgboost_hpo"]
     train_cfg = cfg["training"]
-    rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best"
+    rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "XGBoost" / mat_dir / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
