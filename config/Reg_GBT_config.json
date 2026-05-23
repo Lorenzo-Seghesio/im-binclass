@@ -1,18 +1,3 @@
-{
-  "_comment": "Hyperparameter config for Reg_GBT_IM.py. Scalar value = fixed. Array [min, max] = optimized by Optuna.",
-  "dataset": "PP_1",
-  "opt_metric": "mae",
-  "hyperparameters": {
-    "n_estimators": [50, 500],
-    "max_depth": [2, 8],
-    "learning_rate": [0.01, 0.3],
-    "subsample": [0.5, 1.0],
-    "min_samples_split": [2, 20],
-    "min_samples_leaf": [1, 10],
-    "max_features": 1.0
-  },
-  "optuna_trials": {
-    "startup_trials": 20,
-    "tot_trials": 60
-  }
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:1256e894be634d0301f29ba80d2239d757b919038c0819ca0db3a29fff6b918b
+size 482

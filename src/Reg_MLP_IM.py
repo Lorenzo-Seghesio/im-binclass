@@ -29,6 +29,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from an
 # e.g. outputs/Reg/ABS, outputs/Reg/PP_1, etc.
 OUT_DIR = BASE_DIR / 'outputs/Reg'
 
+# Colour palette (Tableau 10) — consistent across all plot types
+CAVITY_COLORS      = {'P1': '#4E79A7', 'P2': '#F28E2B'}   # steel blue / orange
+MODEL_COLORS       = {'TPE': '#59A14F', 'RS': '#B07AA1'}  # green / purple
+PERFECT_PRED_COLOR = '#333333'                             # dark gray
+
 # Global variables
 best_metric_global = float('inf')
 best_model_global = None
@@ -544,12 +549,22 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     print(f"MAPE: {mape_rs:.2f}%")
     print(f"Max Error: {max_error_rs:.4f}")
 
+    # Determine plot colours: single-cavity → cavity colour; double-cavity → model colours
+    _name = OUT_DIR.name
+    if _name.endswith('_1'):
+        _color_tp = _color_rs = CAVITY_COLORS['P1']
+    elif _name.endswith('_2'):
+        _color_tp = _color_rs = CAVITY_COLORS['P2']
+    else:
+        _color_tp, _color_rs = MODEL_COLORS['TPE'], MODEL_COLORS['RS']
+
     # Create scatter plots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
     # TPE scatter plot
-    ax1.scatter(y_test, y_pred_tp, alpha=0.5, s=30)
-    ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+    ax1.scatter(y_test, y_pred_tp, alpha=0.5, s=30, color=_color_tp)
+    ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+             '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
     ax1.set_xlabel('True Values [g]')
     ax1.set_ylabel('Predictions [g]')
     ax1.set_title(f'TPE Model: Predicted vs True\nMAE={mae_tp:.4f}, R²={r2_tp:.4f}')
@@ -557,8 +572,9 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     ax1.grid(alpha=0.3)
     
     # RS scatter plot
-    ax2.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color='green')
-    ax2.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+    ax2.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color=_color_rs)
+    ax2.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+             '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
     ax2.set_xlabel('True Values [g]')
     ax2.set_ylabel('Predictions [g]')
     ax2.set_title(f'RS Model: Predicted vs True\nMAE={mae_rs:.4f}, R²={r2_rs:.4f}')
@@ -571,8 +587,9 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     
     # Save individual scatter plots
     plt.figure(figsize=(8, 6))
-    plt.scatter(y_test, y_pred_tp, alpha=0.5, s=30)
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+    plt.scatter(y_test, y_pred_tp, alpha=0.5, s=30, color=_color_tp)
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+             '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
     plt.xlabel('True Values [g]')
     plt.ylabel('Predictions [g]')
     plt.title(f'TPE Model: Predicted vs True\nMAE={mae_tp:.4f}, R²={r2_tp:.4f}')
@@ -582,8 +599,9 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     plt.close()
     
     plt.figure(figsize=(8, 6))
-    plt.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color='green')
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+    plt.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color=_color_rs)
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+             '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
     plt.xlabel('True Values [g]')
     plt.ylabel('Predictions [g]')
     plt.title(f'RS Model: Predicted vs True\nMAE={mae_rs:.4f}, R²={r2_rs:.4f}')
@@ -599,18 +617,18 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
     # TPE residual plot
-    ax1.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30)
-    ax1.axhline(y=0, color='r', linestyle='--', lw=2)
+    ax1.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30, color=_color_tp)
+    ax1.axhline(y=0, color=PERFECT_PRED_COLOR, linestyle='--', lw=2)
     ax1.set_xlabel('Predicted Values [g]')
-    ax1.set_ylabel('Residuals')
+    ax1.set_ylabel('Residuals [g]')
     ax1.set_title(f'TPE Model: Residual Plot\nMAE={mae_tp:.4f}')
     ax1.grid(alpha=0.3)
     
     # RS residual plot
-    ax2.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color='green')
-    ax2.axhline(y=0, color='r', linestyle='--', lw=2)
+    ax2.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color=_color_rs)
+    ax2.axhline(y=0, color=PERFECT_PRED_COLOR, linestyle='--', lw=2)
     ax2.set_xlabel('Predicted Values [g]')
-    ax2.set_ylabel('Residuals')
+    ax2.set_ylabel('Residuals [g]')
     ax2.set_title(f'RS Model: Residual Plot\nMAE={mae_rs:.4f}')
     ax2.grid(alpha=0.3)
     
@@ -620,20 +638,20 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     
     # Save individual residual plots
     plt.figure(figsize=(8, 6))
-    plt.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30)
-    plt.axhline(y=0, color='r', linestyle='--', lw=2)
+    plt.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30, color=_color_tp)
+    plt.axhline(y=0, color=PERFECT_PRED_COLOR, linestyle='--', lw=2)
     plt.xlabel('Predicted Values [g]')
-    plt.ylabel('Residuals')
+    plt.ylabel('Residuals [g]')
     plt.title(f'TPE Model: Residual Plot\nMAE={mae_tp:.4f}')
     plt.grid(alpha=0.3)
     plt.savefig(str(OUT_DIR / 'images/residual_plot_TPE.png'), dpi=300, bbox_inches='tight')
     plt.close()
     
     plt.figure(figsize=(8, 6))
-    plt.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color='green')
-    plt.axhline(y=0, color='r', linestyle='--', lw=2)
+    plt.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color=_color_rs)
+    plt.axhline(y=0, color=PERFECT_PRED_COLOR, linestyle='--', lw=2)
     plt.xlabel('Predicted Values [g]')
-    plt.ylabel('Residuals')
+    plt.ylabel('Residuals [g]')
     plt.title(f'RS Model: Residual Plot\nMAE={mae_rs:.4f}')
     plt.grid(alpha=0.3)
     plt.savefig(str(OUT_DIR / 'images/residual_plot_RS.png'), dpi=300, bbox_inches='tight')
@@ -1111,8 +1129,8 @@ def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, ca
         print(f"\n--- Cavity {cav} ({mask.sum()} samples) ---")
         print(f"  MAE: {mae:.4f}  RMSE: {rmse:.4f}  R\u00b2: {r2:.4f}  MAPE: {mape:.2f}%")
         lims = [min(y_cav.min(), y_pred.min()), max(y_cav.max(), y_pred.max())]
-        ax.scatter(y_cav, y_pred, alpha=0.5, s=30)
-        ax.plot(lims, lims, 'r--', lw=2, label='Perfect prediction')
+        ax.scatter(y_cav, y_pred, alpha=0.5, s=30, color=CAVITY_COLORS.get(str(cav), CAVITY_COLORS['P1']))
+        ax.plot(lims, lims, '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
         ax.set_xlabel('True Values [g]'); ax.set_ylabel('Predictions [g]')
         ax.set_title(f'{model_name} \u2014 Cavity {cav}\nMAE={mae:.4f}, R\u00b2={r2:.4f}')
         ax.legend(); ax.grid(alpha=0.3)

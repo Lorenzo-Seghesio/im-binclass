@@ -1,21 +1,3 @@
-{
-    "model_name": "TPE",
-    "opt_metric": "rmse",
-    "opt_score": 0.005341636514024859,
-    "mae": 0.004074108906413814,
-    "rmse": 0.005341636514024859,
-    "r2": 0.9991444875268574,
-    "mape": 0.02825016530539063,
-    "max_error": 0.018764232871948394,
-    "timestamp": "2026-03-24 17:18:58",
-    "hyperparameters": {
-        "lr": 0.00790119336725144,
-        "dropout": 0.31120619230526525,
-        "weight_decay": 0.0014006600462296765,
-        "n_layers": 1,
-        "size_layer0": 87
-    },
-    "train_samples": 440,
-    "test_samples": 112,
-    "n_features": 16
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:58ee109741df979873ffff2a2b6f4822ec8ac449cea1e40d7c1fcae650fdf629
+size 582

@@ -26,6 +26,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 # Output root — overridden at runtime in __main__ based on dataset choice
 OUT_DIR = BASE_DIR / 'outputs/Reg_GBT'
 
+# Colour palette (Wong, colorblind-friendly) — consistent across all plot types
+CAVITY_COLORS    = {'P1': '#0072B2', 'P2': '#D55E00'}   # blue / vermilion
+MODEL_COLORS     = {'TPE': '#009E73', 'RS': '#CC79A7'}  # teal / mauve
+PERFECT_PRED_COLOR = '#333333'                           # dark gray
+
 # Globals for tracking best models across Optuna trials
 best_metric_global = float('inf')
 best_model_global = None
@@ -178,6 +183,16 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test):
     y_pred_tp = model_tp.predict(X_test)
     y_pred_rs = model_rs.predict(X_test)
 
+    # Single-cavity run → use the cavity's designated colour for both models.
+    # Double-cavity run → keep the standard TPE/RS model colours.
+    _name = OUT_DIR.name
+    if _name.endswith('_1'):
+        _color_tp = _color_rs = CAVITY_COLORS['P1']
+    elif _name.endswith('_2'):
+        _color_tp = _color_rs = CAVITY_COLORS['P2']
+    else:
+        _color_tp, _color_rs = MODEL_COLORS['TPE'], MODEL_COLORS['RS']
+
     def _metrics(y_true, y_pred):
         mae  = float(mean_absolute_error(y_true, y_pred))
         rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
@@ -199,11 +214,12 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test):
     # ---- scatter plots ----
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     for ax, y_pred, label, color, mae, r2 in [
-        (ax1, y_pred_tp, 'TPE', 'steelblue', mae_tp, r2_tp),
-        (ax2, y_pred_rs, 'RS',  'green',     mae_rs, r2_rs),
+        (ax1, y_pred_tp, 'TPE', _color_tp, mae_tp, r2_tp),
+        (ax2, y_pred_rs, 'RS',  _color_rs, mae_rs, r2_rs),
     ]:
         ax.scatter(y_test, y_pred, alpha=0.5, s=30, color=color)
-        ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+        ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+                '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
         ax.set_xlabel('True Values [g]'); ax.set_ylabel('Predictions [g]')
         ax.set_title(f'{label} Model: Predicted vs True\nMAE={mae:.4f}, R²={r2:.4f}')
         ax.legend(); ax.grid(alpha=0.3)
@@ -212,42 +228,43 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test):
     plt.close()
 
     for y_pred, label, color, mae, r2 in [
-        (y_pred_tp, 'TPE', 'steelblue', mae_tp, r2_tp),
-        (y_pred_rs, 'RS',  'green',     mae_rs, r2_rs),
+        (y_pred_tp, 'TPE', _color_tp, mae_tp, r2_tp),
+        (y_pred_rs, 'RS',  _color_rs, mae_rs, r2_rs),
     ]:
         plt.figure(figsize=(8, 6))
         plt.scatter(y_test, y_pred, alpha=0.5, s=30, color=color)
-        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()],
+                 '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
         plt.xlabel('True Values [g]'); plt.ylabel('Predictions [g]')
         plt.title(f'{label} Model: Predicted vs True\nMAE={mae:.4f}, R²={r2:.4f}')
-        plt.grid(alpha=0.3)
+        plt.legend(); plt.grid(alpha=0.3)
         plt.savefig(str(OUT_DIR / f'images/scatter_plot_{label}.png'), dpi=300, bbox_inches='tight')
         plt.close()
 
     # ---- residual plots ----
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     for ax, y_pred, label, color, mae in [
-        (ax1, y_pred_tp, 'TPE', 'steelblue', mae_tp),
-        (ax2, y_pred_rs, 'RS',  'green',     mae_rs),
+        (ax1, y_pred_tp, 'TPE', _color_tp, mae_tp),
+        (ax2, y_pred_rs, 'RS',  _color_rs, mae_rs),
     ]:
         residuals = y_test - y_pred
         ax.scatter(y_pred, residuals, alpha=0.5, s=30, color=color)
         ax.axhline(y=0, color='r', linestyle='--', lw=2)
-        ax.set_xlabel('Predicted Values [g]'); ax.set_ylabel('Residuals')
+        ax.set_xlabel('Predicted Values [g]'); ax.set_ylabel('Residuals [g]')
         ax.set_title(f'{label} Model: Residual Plot\nMAE={mae:.4f}'); ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(str(OUT_DIR / 'images/residual_plots_comparison.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
     for y_pred, label, color, mae in [
-        (y_pred_tp, 'TPE', 'steelblue', mae_tp),
-        (y_pred_rs, 'RS',  'green',     mae_rs),
+        (y_pred_tp, 'TPE', _color_tp, mae_tp),
+        (y_pred_rs, 'RS',  _color_rs, mae_rs),
     ]:
         residuals = y_test - y_pred
         plt.figure(figsize=(8, 6))
         plt.scatter(y_pred, residuals, alpha=0.5, s=30, color=color)
         plt.axhline(y=0, color='r', linestyle='--', lw=2)
-        plt.xlabel('Predicted Values [g]'); plt.ylabel('Residuals')
+        plt.xlabel('Predicted Values [g]'); plt.ylabel('Residuals [g]')
         plt.title(f'{label} Model: Residual Plot\nMAE={mae:.4f}'); plt.grid(alpha=0.3)
         plt.savefig(str(OUT_DIR / f'images/residual_plot_{label}.png'), dpi=300, bbox_inches='tight')
         plt.close()
@@ -306,8 +323,8 @@ def _report_per_cavity_metrics(best_model, model_name, test_csv_path):
         print(f"\n--- Cavity {cav} ({mask.sum()} samples) ---")
         print(f"  MAE: {mae:.4f}  RMSE: {rmse:.4f}  R\u00b2: {r2:.4f}  MAPE: {mape:.2f}%")
         lims = [min(y_cav.min(), y_pred.min()), max(y_cav.max(), y_pred.max())]
-        ax.scatter(y_cav, y_pred, alpha=0.5, s=30)
-        ax.plot(lims, lims, 'r--', lw=2, label='Perfect prediction')
+        ax.scatter(y_cav, y_pred, alpha=0.5, s=30, color=CAVITY_COLORS.get(str(cav), CAVITY_COLORS['P1']))
+        ax.plot(lims, lims, '--', color=PERFECT_PRED_COLOR, lw=2, label='Perfect prediction')
         ax.set_xlabel('True Values [g]'); ax.set_ylabel('Predictions [g]')
         ax.set_title(f'{model_name} \u2014 Cavity {cav}\nMAE={mae:.4f}, R\u00b2={r2:.4f}')
         ax.legend(); ax.grid(alpha=0.3)
@@ -501,8 +518,92 @@ def run_optimization(sampler, pruner, csv_path, n_trials=50, n_startup_trials=10
     return trial
 
 
+# === Data Analysis Plots (weight distribution + feature correlations) ===
+def _plot_data_analysis(df, label):
+    """Save weight distribution and feature-weight correlation plots after outlier removal."""
+    analysis_dir = OUT_DIR / 'data_analysis'
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    weight_col   = 'Product weight g'
+    skip_cols    = {'shot', 'cavity', weight_col}
+    feature_cols = [c for c in df.columns if c not in skip_cols]
+
+    # --- Weight distribution: histogram + time series ---
+    w = df[weight_col]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].hist(w, bins=40, color='steelblue', edgecolor='black', alpha=0.7)
+    axes[0].set_xlabel('Weight [g]')
+    axes[0].set_ylabel('Count')
+    axes[0].set_title(
+        f'{label} — Weight Distribution\n'
+        f'n={len(w)},  μ={w.mean():.4f} g,  σ={w.std():.4f} g'
+    )
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(w.values, alpha=0.6, linewidth=0.8, color='steelblue')
+    axes[1].set_xlabel('Sample Index')
+    axes[1].set_ylabel('Weight [g]')
+    axes[1].set_title(f'{label} — Weight over Samples')
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(analysis_dir / f'weight_distribution_{label}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  [data_analysis] Weight plot saved: weight_distribution_{label}.png")
+
+    # --- Feature–weight Pearson correlation ---
+    corr = (
+        df[feature_cols + [weight_col]]
+        .corr()[weight_col]
+        .drop(weight_col)
+        .sort_values(key=abs, ascending=False)
+    )
+
+    n_feat = len(corr)
+    fig_w  = max(10, n_feat * 0.45)
+    fig, ax = plt.subplots(figsize=(fig_w, 6))
+    colors = ['steelblue' if v >= 0 else 'salmon' for v in corr.values]
+    ax.bar(range(n_feat), corr.values, color=colors)
+    ax.set_xticks(range(n_feat))
+    ax.set_xticklabels(corr.index, rotation=90, fontsize=8)
+    ax.set_ylabel('Pearson Correlation with Weight')
+    ax.set_title(f'{label} — Feature Correlation with Product Weight')
+    ax.axhline(0, color='black', linewidth=0.8)
+    ax.grid(alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(str(analysis_dir / f'feature_correlation_{label}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    corr_df = corr.rename('correlation_with_weight').reset_index()
+    corr_df.columns = ['feature', 'correlation_with_weight']
+    corr_df.to_csv(str(analysis_dir / f'feature_correlation_{label}.csv'), index=False)
+    print(f"  [data_analysis] Correlation plot + CSV saved: feature_correlation_{label}.*")
+
+    # --- Scatter: every feature vs weight (sorted by |correlation|) ---
+    ncols = min(4, n_feat)
+    nrows = int(np.ceil(n_feat / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes_flat = np.array(axes).reshape(-1)
+    for i, feat in enumerate(corr.index):          # corr.index is sorted by |r|
+        ax = axes_flat[i]
+        ax.scatter(df[feat], df[weight_col], alpha=0.3, s=12, color='steelblue')
+        ax.set_xlabel(feat, fontsize=8)
+        ax.set_ylabel('Weight [g]', fontsize=8)
+        ax.set_title(f'r = {corr[feat]:.3f}', fontsize=9)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.3)
+    for j in range(n_feat, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+    plt.suptitle(f'{label} — Feature vs Weight (per part)', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(analysis_dir / f'feature_vs_weight_{label}.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  [data_analysis] Feature vs weight scatter saved: feature_vs_weight_{label}.png")
+
+
 # === Process Double Cavity Dataset ===
-def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path):
+def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path,
+                                  data_analysis=False):
     df_1 = pd.read_csv(csv_path_1)
     df_2 = pd.read_csv(csv_path_2)
     if 'shot' not in df_1.columns or 'shot' not in df_2.columns:
@@ -514,6 +615,10 @@ def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_c
     print(f"Outliers — P1: {outliers_p1.sum()}, P2: {outliers_p2.sum()}")
     df_1 = df_1[~outliers_p1].reset_index(drop=True)
     df_2 = df_2[~outliers_p2].reset_index(drop=True)
+
+    if data_analysis:
+        _plot_data_analysis(df_1, f'{OUT_DIR.name}_P1')
+        _plot_data_analysis(df_2, f'{OUT_DIR.name}_P2')
 
     unique_shots = df_1['shot'].unique()
     np.random.seed(41)
@@ -549,7 +654,8 @@ def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_c
 
 
 # === Process Single Cavity Dataset ===
-def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
+def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path,
+                                  data_analysis=False):
     df = pd.read_csv(csv_path)
     cols_to_drop = [c for c in ['shot', 'shot_position'] if c in df.columns]
     if cols_to_drop:
@@ -560,6 +666,9 @@ def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
     outliers = detect_outliers_iqr(df['Product weight g'])
     print(f"Outliers detected: {outliers.sum()}")
     df = df[~outliers].reset_index(drop=True)
+
+    if data_analysis:
+        _plot_data_analysis(df, OUT_DIR.name)
 
     np.random.seed(41)
     idx = np.random.permutation(len(df))
@@ -578,6 +687,9 @@ if __name__ == "__main__":
                         choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2',
                                  'pp_1', 'pp_2', 'abs_1', 'abs_2'])
     parser.add_argument('--opt_metric', type=str, choices=VALID_OPT_METRICS)
+    parser.add_argument('--data_analysis', action='store_true',
+                        help='Generate and save data analysis plots (weight distribution, '
+                             'feature correlations, feature-vs-weight scatters).')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -615,9 +727,11 @@ if __name__ == "__main__":
     start_time = time.time()
 
     if double_cavity:
-        process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path)
+        process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path,
+                                      data_analysis=args.data_analysis)
     else:
-        process_single_cavity_dataset(csv_path_1, train_csv_path, test_csv_path)
+        process_single_cavity_dataset(csv_path_1, train_csv_path, test_csv_path,
+                                      data_analysis=args.data_analysis)
 
     optuna_trials    = cfg.get('optuna_trials', {})
     n_startup_trials = optuna_trials.get('startup_trials', 10)
