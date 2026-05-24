@@ -48,6 +48,58 @@ import xgboost as xgb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ── Publication plot style ────────────────────────────────────────────────────
+_PLT_C: dict = {
+    "scatter":    "#2166AC",   # steel blue   — scatter dots / predictions
+    "ideal_line": "#B2182B",   # muted red    — 1:1 diagonal reference
+    "residual":   "#1B7837",   # forest green — residual scatter & histogram
+    "mean_line":  "#1B7837",   # forest green — mean residual vline
+    "zero_line":  "#555555",   # dark grey    — y = 0 reference
+    "fold":       "#4393C3",   # light blue   — per-fold CV bars
+    "fold_mean":  "#D6604D",   # coral        — mean CV bar
+    "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "ig":         "#7D54A4",   # purple       — IG / Expected Gradients bars
+    "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
+    "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
+    "total":      "#1B7837",   # green        — total combined attribution
+    "f_feat":     "#E69F00",   # gold         — M1-merge f encoder features
+    "pp_feat":    "#2166AC",   # blue         — M1-merge pp_direct features
+    "pressure":   "#2166AC",   # blue         — GradCAM pressure curve
+    "gradcam":    "#B2182B",   # red          — GradCAM activation overlay
+}
+
+
+def _strip_prefix(name: str) -> str:
+    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+        if name.startswith(pfx):
+            return name[len(pfx):]
+    return name
+
+
+def _strip_prefixes(names) -> list:
+    return [_strip_prefix(n) for n in names]
+
+
+plt.rcParams.update({
+    "font.family": "sans-serif", "font.size": 10,
+    "axes.labelsize": 11, "axes.titlesize": 12,
+    "axes.titleweight": "bold", "axes.titlepad": 10,
+    "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.8,
+    "axes.grid": True, "grid.color": "#E0E0E0", "grid.linestyle": "--",
+    "grid.linewidth": 0.5, "axes.axisbelow": True,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.size": 3.5, "ytick.major.size": 3.5,
+    "xtick.major.width": 0.7, "ytick.major.width": 0.7,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+    "savefig.facecolor": "white", "legend.framealpha": 0.92,
+    "legend.edgecolor": "#CCCCCC", "legend.frameon": True,
+    "lines.linewidth": 1.8, "patch.linewidth": 0.4,
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -218,16 +270,19 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    iqr_k = prep_cfg["iqr_multiplier"]
-    mask  = pd.Series(True, index=df.index)
-    for col in pp_cols + [target_col]:
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-        iqr    = q3 - q1
-        if iqr > 0:
-            mask &= (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
-    n_removed = int((~mask).sum())
-    df = df[mask].copy()
-    print(f"Outliers removed  : {n_removed}  →  {len(df)} parts remaining")
+    # pp_cols are pre-cleaned by clean_data.py (X-outliers already removed).
+    # Apply IQR filter to target_col only (y-outlier removal on the dev dataset).
+    iqr_k  = prep_cfg["iqr_multiplier"]
+    col    = target_col
+    q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+    iqr    = q3 - q1
+    if iqr > 0:
+        y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+    else:
+        y_mask = pd.Series(True, index=df.index)
+    n_removed = int((~y_mask).sum())
+    df = df[y_mask].copy()
+    print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining")
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
@@ -238,7 +293,7 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     print(f"pp features: {X_pp.shape[1]}  |  time steps: {X_pt.shape[1]}  |  samples: {len(y)}")
     print(f"Target: mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
-    return part_ids, X_pp, X_pt, y, strat_labels
+    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols
 
 
 def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray) -> list:
@@ -357,23 +412,20 @@ def evaluate_gbdt(model, X: np.ndarray, y: np.ndarray) -> dict:
 def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str,
                   out_dir: Path, label: str):
     """Bar chart of per-fold indicative CV metrics (secondary output)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
-    fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(14, 4.5))
     fold_labels = [f"F{i + 1}" for i in range(K)] + ["Mean"]
-    bar_colors  = [C_BLUE] * K + [C_RED]
+    bar_colors  = [_PLT_C["fold"]] * K + [_PLT_C["fold_mean"]]
     for ax, metric in zip(axes, ["MAE", "RMSE", "R2", "MSE"]):
         vals = list(metrics_df[metric]) + [metrics_df[metric].mean()]
-        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="k", linewidth=0.4)
-        ax.set_title(metric, fontsize=10)
+        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="none", width=0.65)
+        ax.set_title(metric)
         ax.set_ylabel(metric)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.7)
-        ax.set_axisbelow(True)
+                    f"{v:.3f}", ha="center", va="bottom")
     fig.suptitle(f"[{material} | {label}] Indicative {K}-fold CV on dev set", fontsize=13)
     fig.tight_layout()
-    fig.savefig(out_dir / "cv_metrics_folds.png", dpi=150)
+    fig.savefig(out_dir / "cv_metrics_folds.png")
     plt.close(fig)
     print(f"  CV plots saved → {out_dir}")
 
@@ -382,41 +434,36 @@ def save_final_test_plots(y_test: np.ndarray, preds: np.ndarray,
                           final_metrics: dict, out_dir: Path,
                           material: str, label: str):
     """Scatter + residuals from the final model on the held-out test set (primary output)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
-    # Scatter
+    # Scatter: measured vs predicted
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(y_test, preds, alpha=0.7, edgecolors="k",
-               linewidths=0.3, color=C_BLUE, zorder=3)
+    ax.scatter(y_test, preds, color=_PLT_C["scatter"],
+               s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
     lo = min(y_test.min(), preds.min())
     hi = max(y_test.max(), preds.max())
-    ax.plot([lo, hi], [lo, hi], color=C_RED, linestyle="--", linewidth=1.5, label="Ideal (1:1)")
-    ax.set_xlabel("Real weight [g]", fontsize=12)
-    ax.set_ylabel("Predicted weight [g]", fontsize=12)
+    ax.plot([lo, hi], [lo, hi], color=_PLT_C["ideal_line"], linestyle="--", linewidth=1.5, label="Perfect prediction")
+    ax.set_xlabel("Measured weight [g]")
+    ax.set_ylabel("Predicted weight [g]")
     ax.set_title(
         f"[{material} | {label}] Final Model — Held-out Test\n"
         f"MAE={final_metrics['MAE']:.4f} g   R²={final_metrics['R2']:.4f}",
-        fontsize=11)
-    ax.legend(fontsize=10)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
+    )
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "scatter_final_test.png", dpi=150)
+    fig.savefig(out_dir / "scatter_final_test.png")
     plt.close(fig)
     # Residuals histogram
     res = preds - y_test
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.hist(res, bins=20, color=C_BLUE, edgecolor="k", linewidth=0.4, alpha=0.85)
-    ax.axvline(0, color=C_RED, linestyle="--", linewidth=1.5)
-    ax.axvline(float(res.mean()), color="#009E73", linestyle="-",
+    ax.hist(res, bins=20, color=_PLT_C["residual"], edgecolor="white", alpha=0.85)
+    ax.axvline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+    ax.axvline(float(res.mean()), color=_PLT_C["mean_line"], linestyle="-",
                linewidth=1.5, label=f"Mean={res.mean():.4f}")
-    ax.set_xlabel("Residual (pred − real) [g]", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title(f"[{material} | {label}] Residuals  std={res.std():.4f} g", fontsize=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
+    ax.set_xlabel("Residual (pred − real) [g]")
+    ax.set_ylabel("Count")
+    ax.set_title(f"[{material} | {label}] Residuals  std={res.std():.4f} g")
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "residuals_hist_final_test.png", dpi=150)
+    fig.savefig(out_dir / "residuals_hist_final_test.png")
     plt.close(fig)
     print(f"  Final test plots saved → {out_dir}")
 
@@ -486,10 +533,234 @@ def save_model_gbdt(model, final_metrics: dict,
 
 
 def _copy_artefacts(run_best_dir: Path, overall_best_dir: Path):
-    for fname in ["hpo_best_config.json", "hpo_trials.csv", "cv_fold_metrics.csv"]:
+    for fname in [
+        "hpo_best_config.json", "hpo_trials.csv", "cv_fold_metrics.csv",
+        "xai_shap_bar.png", "xai_shap_beeswarm.png",
+        "xai_ig_bar.png", "xai_gradcam.png", "run_info.json",
+    ]:
         src = run_best_dir / fname
         if src.exists():
             shutil.copy2(src, overall_best_dir / fname)
+
+
+# ── XAI helpers ───────────────────────────────────────────────────────────────
+
+def _save_run_info(rb_dir: Path, ob_dir: Path, mat: str, label: str, updated: bool):
+    """Write run_info.json to run_best and (if overall best) to best_overall."""
+    info = {
+        "run_ts":       _RUN_TS,
+        "material":     mat,
+        "model":        label,
+        "run_best_dir": str(rb_dir.relative_to(BASE_DIR)),
+    }
+    (rb_dir / "run_info.json").write_text(json.dumps(info, indent=2))
+    if updated:
+        (ob_dir / "run_info.json").write_text(json.dumps(info, indent=2))
+    print(f"  [{label}] run_info saved → {rb_dir}")
+
+
+def _xai_shap_gbdt(model, X_train: np.ndarray, X_test: np.ndarray,
+                   pp_cols: list, out_dir: Path, label: str):
+    """SHAP TreeExplainer for GBDT models (LightGBM / XGBoost).
+    Produces bar (mean |SHAP|) and beeswarm plots on the held-out test set.
+    """
+    try:
+        import shap
+    except ImportError:
+        print(f"  [XAI-{label}] shap not installed — skipping SHAP")
+        return
+    try:
+        explainer = shap.TreeExplainer(model, X_train)
+        shap_vals = explainer.shap_values(X_test)          # (n_test, n_features)
+
+        feat_names = _strip_prefixes(pp_cols)
+        shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
+                          plot_type="bar", show=False)
+        plt.savefig(out_dir / "xai_shap_bar.png")
+        plt.close()
+
+        shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
+                          plot_type="dot", show=False)
+        plt.savefig(out_dir / "xai_shap_beeswarm.png")
+        plt.close()
+        print(f"  [XAI-{label}] SHAP saved → {out_dir}")
+    except Exception as exc:
+        print(f"  [XAI-{label}] SHAP failed: {exc}")
+
+
+def _xai_shap_mlp(model: nn.Module, X_bg_sc: np.ndarray, X_test_sc: np.ndarray,
+                  pp_cols: list, out_dir: Path, label: str, device: torch.device,
+                  n_bg: int = 100):
+    """SHAP GradientExplainer for PyTorch MLP.
+    Background = random sample of dev data (scaled). Test = scaled test set.
+    """
+    try:
+        import shap
+    except ImportError:
+        print(f"  [XAI-{label}] shap not installed — skipping SHAP")
+        return
+    try:
+        model.eval()
+        rng    = np.random.default_rng(42)
+        idx    = rng.choice(len(X_bg_sc), min(n_bg, len(X_bg_sc)), replace=False)
+        bg_t   = torch.tensor(X_bg_sc[idx],  dtype=torch.float32, device=device)
+        X_te_t = torch.tensor(X_test_sc,     dtype=torch.float32, device=device)
+
+        # GradientExplainer needs 2-D output (n, 1); MLPModel.forward squeezes to 1-D
+        class _Wrap2D(nn.Module):
+            def __init__(self, m): super().__init__(); self.m = m
+            def forward(self, x): return self.m(x).unsqueeze(-1)
+
+        explainer = shap.GradientExplainer(_Wrap2D(model), bg_t)
+        raw       = explainer.shap_values(X_te_t)
+        shap_np   = np.array(raw[0] if isinstance(raw, list) else raw)
+
+        feat_names = _strip_prefixes(pp_cols)
+        shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
+                          plot_type="bar", show=False)
+        plt.savefig(out_dir / "xai_shap_bar.png")
+        plt.close()
+
+        shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
+                          plot_type="dot", show=False)
+        plt.savefig(out_dir / "xai_shap_beeswarm.png")
+        plt.close()
+        print(f"  [XAI-{label}] SHAP saved → {out_dir}")
+    except Exception as exc:
+        print(f"  [XAI-{label}] SHAP failed: {exc}")
+
+
+def _xai_ig_mlp(model: nn.Module, X_test_sc: np.ndarray, X_bg_sc: np.ndarray,
+                pp_cols: list, out_dir: Path, label: str, device: torch.device,
+                n_steps: int = 50, n_eg_bg: int = 20):
+    """Expected Gradients for PyTorch MLP (Riemann midpoint approximation).
+    Averages IG over n_eg_bg baselines sampled randomly from X_bg_sc (dev, scaled).
+    Plots mean |EG| bar chart.
+    """
+    try:
+        model.eval()
+        rng    = np.random.default_rng(42)
+        K      = min(n_eg_bg, len(X_bg_sc))
+        bl_idx = rng.choice(len(X_bg_sc), size=K, replace=False)
+        X_t    = torch.tensor(X_test_sc, dtype=torch.float32, device=device)
+
+        eg_acc = torch.zeros_like(X_t)             # accumulates per-baseline IG
+        for k in range(K):
+            baseline = torch.tensor(X_bg_sc[bl_idx[k]:bl_idx[k]+1],
+                                    dtype=torch.float32, device=device)  # (1, d)
+            delta    = X_t - baseline               # (n, d)
+            grads    = torch.zeros_like(X_t)
+            for step in range(n_steps):
+                alpha   = (step + 0.5) / n_steps
+                x_alpha = (baseline + alpha * delta).detach().requires_grad_(True)
+                model(x_alpha).sum().backward()
+                grads  += x_alpha.grad.detach()
+            eg_acc += (grads / n_steps) * delta.detach()  # IG for this baseline
+
+        eg      = eg_acc / K                        # (n, d) — Expected Gradients
+        eg_mean = eg.abs().mean(dim=0).cpu().numpy()  # mean |EG| per feature
+
+        order = np.argsort(eg_mean)                 # ascending for horizontal bar
+        feats = [_strip_prefix(pp_cols[i]) for i in order]
+        vals  = eg_mean[order]
+
+        fig, ax = plt.subplots(figsize=(8, max(4, len(pp_cols) * 0.35 + 1)))
+        ax.barh(feats, vals, color=_PLT_C["ig"], edgecolor="none")
+        ax.set_xlabel("Mean |Expected Gradient|")
+        ax.set_title(f"[{label}] Expected Gradients — test set"
+                     f" ({K} random baselines from dev)")
+        fig.tight_layout()
+        fig.savefig(out_dir / "xai_ig_bar.png")
+        plt.close(fig)
+        print(f"  [XAI-{label}] Expected Gradients saved → {out_dir}")
+    except Exception as exc:
+        print(f"  [XAI-{label}] EG failed: {exc}")
+
+
+def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
+                         out_dir: Path, label: str, device: torch.device):
+    """GradCAM on the last Conv1d of EncoderModel.
+    Produces (1) mean heatmap overlaid on mean pressure curve and
+             (2) per-sample heatmap as an image.
+    """
+    try:
+        model.eval()
+        last_conv = None
+        for m in model.convs:
+            if isinstance(m, nn.Conv1d):
+                last_conv = m
+        if last_conv is None:
+            print(f"  [XAI-{label}] No Conv1d found — skipping GradCAM")
+            return
+
+        activations: dict = {}
+        gradients:   dict = {}
+
+        def _fwd(module, inp, out):
+            activations["val"] = out.detach()
+
+        def _bwd(module, gin, gout):
+            gradients["val"] = gout[0].detach()
+
+        fwd_h = last_conv.register_forward_hook(_fwd)
+        bwd_h = last_conv.register_full_backward_hook(_bwd)
+
+        X_t = torch.tensor(X_test_sc[:, None, :], dtype=torch.float32, device=device)
+        model.zero_grad()
+        model(X_t).sum().backward()
+        fwd_h.remove()
+        bwd_h.remove()
+
+        act = activations["val"]                                   # (B, C, T')
+        grd = gradients["val"]                                     # (B, C, T')
+        cam = (grd.mean(dim=-1, keepdim=True) * act).sum(dim=1)   # (B, T')
+        cam = torch.clamp(cam, min=0).cpu().numpy()                # relu
+
+        cam_max = cam.max(axis=1, keepdims=True)
+        cam_max[cam_max == 0] = 1.0
+        cam /= cam_max
+
+        T_orig   = X_test_sc.shape[1]
+        t_orig   = np.linspace(0, 1, T_orig)
+        t_cam    = np.linspace(0, 1, cam.shape[1])
+        cam_up   = np.stack([np.interp(t_orig, t_cam, cam[i]) for i in range(len(cam))])
+        mean_cam = cam_up.mean(axis=0)                             # (T_orig,)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 7))
+
+        ax = axes[0]
+        t_ax = np.arange(T_orig)
+        ax.plot(t_ax, X_test_sc.mean(axis=0), color=_PLT_C["pressure"],
+                linewidth=1.5, label="Mean pressure (test, normalised)")
+        ax2 = ax.twinx()
+        ax2.spines["right"].set_visible(True)
+        ax2.spines["top"].set_visible(False)
+        ax2.fill_between(t_ax, mean_cam, alpha=0.35, color=_PLT_C["gradcam"], label="GradCAM (mean)")
+        ax2.set_ylabel("GradCAM activation", color=_PLT_C["gradcam"])
+        ax2.tick_params(axis="y", labelcolor=_PLT_C["gradcam"])
+        ax2.set_ylim(0, 1.3)
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Normalised pressure", color=_PLT_C["pressure"])
+        ax.tick_params(axis="y", labelcolor=_PLT_C["pressure"])
+        ax.set_title(f"[{label}] GradCAM — averaged over test set")
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2)
+
+        ax = axes[1]
+        im = ax.imshow(cam_up, aspect="auto", cmap="inferno",
+                       interpolation="nearest", vmin=0, vmax=1)
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Test sample index")
+        ax.set_title(f"[{label}] GradCAM per-sample heatmap")
+        fig.colorbar(im, ax=ax, label="GradCAM (normalised)")
+
+        fig.tight_layout()
+        fig.savefig(out_dir / "xai_gradcam.png")
+        plt.close(fig)
+        print(f"  [XAI-{label}] GradCAM saved → {out_dir}")
+    except Exception as exc:
+        print(f"  [XAI-{label}] GradCAM failed: {exc}")
 
 
 # ── CV runners ────────────────────────────────────────────────────────────────
@@ -961,6 +1232,11 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     arch_info = {"channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
                  "head_hidden": head_hidden, "dropout": dropout}
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "Encoder")
+
+    # XAI — GradCAM on the last Conv1d layer
+    _xai_gradcam_encoder(final_model, scale(X_pt[test_idx]), rb_dir, "Encoder", device)
+
+    _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
@@ -969,7 +1245,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
 
 def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
-            dev_idx: np.ndarray, test_idx: np.ndarray):
+            dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
     hpo_cfg   = cfg["mlp_hpo"]
     train_cfg = cfg["training"].copy()
     rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best" / _RUN_TS
@@ -1032,6 +1308,13 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
     arch_info = {"n_in": n_in, "hidden_dims": hidden_dims, "dropout": dropout}
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "MLP")
+
+    # XAI — SHAP (GradientExplainer) + Integrated Gradients on scaled data
+    X_dev_sc = sc.transform(X_pp[dev_idx]).astype(np.float32)
+    _xai_shap_mlp(final_model, X_dev_sc, X_te_s, pp_cols, rb_dir, "MLP", device)
+    _xai_ig_mlp(final_model, X_te_s, X_dev_sc, pp_cols, rb_dir, "MLP", device)
+
+    _save_run_info(rb_dir, ob_dir, mat, "MLP", updated)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "MLP")
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
@@ -1040,7 +1323,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
 
 def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-             dev_idx: np.ndarray, test_idx: np.ndarray):
+             dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
     hpo_cfg   = cfg["lgbm_hpo"]
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best" / _RUN_TS
@@ -1096,6 +1379,11 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "LightGBM")
+
+    # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
+    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "LightGBM")
+
+    _save_run_info(rb_dir, ob_dir, mat, "LightGBM", updated)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "LightGBM")
         save_cv_plots(metrics_df, K, mat, ob_dir, "LightGBM")
@@ -1104,7 +1392,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
 
 def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-                dev_idx: np.ndarray, test_idx: np.ndarray):
+                dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
     hpo_cfg   = cfg["xgboost_hpo"]
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best" / _RUN_TS
@@ -1160,6 +1448,11 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "XGBoost")
+
+    # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
+    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "XGBoost")
+
+    _save_run_info(rb_dir, ob_dir, mat, "XGBoost", updated)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "XGBoost")
         save_cv_plots(metrics_df, K, mat, ob_dir, "XGBoost")
@@ -1192,7 +1485,7 @@ def main():
     print(f"Material : {mat}  →  output subfolder: {mat_dir}")
     print(f"Config   : {cfg_path}")
 
-    _, X_pp, X_pt, y, strat_labels = load_data(cfg["data"], prep_cfg)
+    _, X_pp, X_pt, y, strat_labels, pp_cols = load_data(cfg["data"], prep_cfg)
 
     # ── One-time initial split (dev / held-out test) ──────────────────────────
     test_frac = prep_cfg.get("test_fraction", 0.2)
@@ -1200,9 +1493,9 @@ def main():
     print(f"\nDev/test split  →  dev={len(dev_idx)}  test={len(test_idx)}")
 
     run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx)
-    run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx)
-    run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx)
-    run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx)
+    run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx, pp_cols)
+    run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+    run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
 
     print(f"\n{'═' * 60}")
     print("All 4 reference models complete.")

@@ -13,12 +13,14 @@ Usage
 The pipeline config (config/WPred_Pipeline_config.json) controls:
   - n_runs_m1          : how many times M1 is launched per material
   - n_runs_m2          : how many times M2 is launched per material after M1 finishes
-  - abort_on_m1_error  : stop the whole pipeline if any M1 run exits with an error
-  - abort_on_m2_error  : stop the whole pipeline if any M2 run exits with an error
-  - scripts.m1 / m2    : paths to the script files (relative to project root)
+  - n_runs_fusion      : how many times Fusion is launched per material after M2
+  - n_runs_ref         : how many times Reference is launched per material
+  - abort_on_*_error   : stop the loop for that model if any run exits with an error
+  - scripts.m1 / m2 / fusion / ref : paths to the script files (relative to project root)
 
-For each material the full M1 loop runs first, then the full M2 loop.
-M2 uses the f-features and train/test split produced by M1's best_overall checkpoint.
+Per-material order: M1 → M2 → Fusion → Reference.
+Fusion is skipped automatically when material=ALL (it only supports PP / ABS).
+M2 is skipped (and so are Fusion) if no M1 run succeeded.
 """
 
 import argparse
@@ -121,16 +123,23 @@ def main() -> None:
         sys.exit(f"[pipeline] Config not found: {cfg_path}")
     cfg = json.loads(cfg_path.read_text())
 
-    n_runs_m1       = int(cfg.get("n_runs_m1", 1))
-    n_runs_m2       = int(cfg.get("n_runs_m2", 1))
-    abort_on_m1_err = bool(cfg.get("abort_on_m1_error", True))
-    abort_on_m2_err = bool(cfg.get("abort_on_m2_error", False))
-    scripts_cfg     = cfg.get("scripts", {})
+    n_runs_m1         = int(cfg.get("n_runs_m1", 1))
+    n_runs_m2         = int(cfg.get("n_runs_m2", 1))
+    n_runs_fusion     = int(cfg.get("n_runs_fusion", 1))
+    n_runs_ref        = int(cfg.get("n_runs_ref", 1))
+    abort_on_m1_err   = bool(cfg.get("abort_on_m1_error", True))
+    abort_on_m2_err   = bool(cfg.get("abort_on_m2_error", False))
+    abort_on_fus_err  = bool(cfg.get("abort_on_fusion_error", False))
+    abort_on_ref_err  = bool(cfg.get("abort_on_ref_error", False))
+    scripts_cfg       = cfg.get("scripts", {})
 
-    m1_script = BASE_DIR / scripts_cfg.get("m1", "src/M1_PPPT_to_W.py")
-    m2_script = BASE_DIR / scripts_cfg.get("m2", "src/M2_PP_to_F.py")
+    m1_script     = BASE_DIR / scripts_cfg.get("m1",     "src/M1_PPPT_to_W.py")
+    m2_script     = BASE_DIR / scripts_cfg.get("m2",     "src/M2_PP_to_F.py")
+    fusion_script = BASE_DIR / scripts_cfg.get("fusion", "src/Fusion_M1M2_WPred.py")
+    ref_script    = BASE_DIR / scripts_cfg.get("ref",    "src/Reference_Models_W_Pred.py")
 
-    for name, path in [("M1", m1_script), ("M2", m2_script)]:
+    for name, path in [("M1", m1_script), ("M2", m2_script),
+                       ("Fusion", fusion_script), ("Ref", ref_script)]:
         if not path.exists():
             sys.exit(f"[pipeline] {name} script not found: {path}")
 
@@ -141,10 +150,14 @@ def main() -> None:
           f"  (abort_on_error={abort_on_m1_err})")
     print(f"  M2        : {m2_script.relative_to(BASE_DIR)}  ×{n_runs_m2}"
           f"  (abort_on_error={abort_on_m2_err})")
+    print(f"  Fusion    : {fusion_script.relative_to(BASE_DIR)}  ×{n_runs_fusion}"
+          f"  (abort_on_error={abort_on_fus_err})  [skipped for material=ALL]")
+    print(f"  Reference : {ref_script.relative_to(BASE_DIR)}  ×{n_runs_ref}"
+          f"  (abort_on_error={abort_on_ref_err})")
 
     t_pipeline_start = time.monotonic()
 
-    # Per-material results: {mat: {"m1": [...], "m2": [...]}}
+    # Per-material results: {mat: {"m1": [...], "m2": [...], "fusion": [...], "ref": [...]}}
     all_results: dict[str, dict[str, list[bool]]] = {}
 
     for mat in materials:
@@ -156,15 +169,28 @@ def main() -> None:
 
         m1_any_ok = any(m1_results)
         if not m1_any_ok:
-            _banner(f"[{mat}] No M1 run succeeded — skipping M2 for {mat}.", char="!")
-            all_results[mat] = {"m1": m1_results, "m2": []}
+            _banner(f"[{mat}] No M1 run succeeded — skipping M2, Fusion, Reference for {mat}.", char="!")
+            all_results[mat] = {"m1": m1_results, "m2": [], "fusion": [], "ref": []}
             continue
 
         # ── Phase 2: M2 ───────────────────────────────────────────────────────
         _banner(f"[{mat}] PHASE 2 — M2  (process params → f-features)")
         m2_results = _run_loop(m2_script, mat, n_runs_m2, f"M2/{mat}", abort_on_m2_err)
 
-        all_results[mat] = {"m1": m1_results, "m2": m2_results}
+        # ── Phase 3: Fusion ───────────────────────────────────────────────────
+        if mat == "ALL":
+            _banner(f"[{mat}] PHASE 3 — Fusion  (skipped: Fusion does not support material=ALL)", char="-")
+            fusion_results: list[bool] = []
+        else:
+            _banner(f"[{mat}] PHASE 3 — Fusion  (M1+M2 outputs → weight prediction)")
+            fusion_results = _run_loop(fusion_script, mat, n_runs_fusion, f"Fusion/{mat}", abort_on_fus_err)
+
+        # ── Phase 4: Reference ────────────────────────────────────────────────
+        _banner(f"[{mat}] PHASE 4 — Reference  (baseline models)")
+        ref_results = _run_loop(ref_script, mat, n_runs_ref, f"Ref/{mat}", abort_on_ref_err)
+
+        all_results[mat] = {"m1": m1_results, "m2": m2_results,
+                            "fusion": fusion_results, "ref": ref_results}
 
     # ── Final summary ─────────────────────────────────────────────────────────
     total_elapsed = time.monotonic() - t_pipeline_start
@@ -173,11 +199,18 @@ def main() -> None:
     any_failure = False
     for mat in materials:
         print(f"\n  ── {mat} ──")
-        m1r = all_results[mat]["m1"]
-        m2r = all_results[mat]["m2"]
-        _print_summary(f"M1/{mat}", m1r)
-        _print_summary(f"M2/{mat}", m2r)
-        if not all(m1r) or not all(m2r):
+        m1r  = all_results[mat]["m1"]
+        m2r  = all_results[mat]["m2"]
+        fusr = all_results[mat]["fusion"]
+        refr = all_results[mat]["ref"]
+        _print_summary(f"M1/{mat}",     m1r)
+        _print_summary(f"M2/{mat}",     m2r)
+        if fusr:
+            _print_summary(f"Fusion/{mat}", fusr)
+        else:
+            print(f"  Fusion/{mat}: skipped")
+        _print_summary(f"Ref/{mat}",    refr)
+        if not all(m1r) or not all(m2r) or not all(fusr) or not all(refr):
             any_failure = True
 
     sys.exit(1 if any_failure else 0)

@@ -50,6 +50,58 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ── Publication plot style ────────────────────────────────────────────────────
+_PLT_C: dict = {
+    "scatter":    "#2166AC",   # steel blue   — scatter dots / predictions
+    "ideal_line": "#B2182B",   # muted red    — 1:1 diagonal reference
+    "residual":   "#1B7837",   # forest green — residual scatter & histogram
+    "mean_line":  "#1B7837",   # forest green — mean residual vline
+    "zero_line":  "#555555",   # dark grey    — y = 0 reference
+    "fold":       "#4393C3",   # light blue   — per-fold CV bars
+    "fold_mean":  "#D6604D",   # coral        — mean CV bar
+    "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "ig":         "#7D54A4",   # purple       — IG / Expected Gradients bars
+    "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
+    "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
+    "total":      "#1B7837",   # green        — total combined attribution
+    "f_feat":     "#E69F00",   # gold         — M1-merge f encoder features
+    "pp_feat":    "#2166AC",   # blue         — M1-merge pp_direct features
+    "pressure":   "#2166AC",   # blue         — GradCAM pressure curve
+    "gradcam":    "#B2182B",   # red          — GradCAM activation overlay
+}
+
+
+def _strip_prefix(name: str) -> str:
+    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+        if name.startswith(pfx):
+            return name[len(pfx):]
+    return name
+
+
+def _strip_prefixes(names) -> list:
+    return [_strip_prefix(n) for n in names]
+
+
+plt.rcParams.update({
+    "font.family": "sans-serif", "font.size": 10,
+    "axes.labelsize": 11, "axes.titlesize": 12,
+    "axes.titleweight": "bold", "axes.titlepad": 10,
+    "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.8,
+    "axes.grid": True, "grid.color": "#E0E0E0", "grid.linestyle": "--",
+    "grid.linewidth": 0.5, "axes.axisbelow": True,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.size": 3.5, "ytick.major.size": 3.5,
+    "xtick.major.width": 0.7, "ytick.major.width": 0.7,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+    "savefig.facecolor": "white", "legend.framealpha": 0.92,
+    "legend.edgecolor": "#CCCCCC", "legend.frameon": True,
+    "lines.linewidth": 1.8, "patch.linewidth": 0.4,
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -62,6 +114,18 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def _scaler_to_dict(sc: MinMaxScaler) -> dict:
+    """Serialise a fitted MinMaxScaler to a JSON-safe dict."""
+    return {
+        "feature_range": list(sc.feature_range),
+        "data_min_":     sc.data_min_.tolist(),
+        "data_max_":     sc.data_max_.tolist(),
+        "scale_":        sc.scale_.tolist(),
+        "min_":          sc.min_.tolist(),
+    }
+
 
 # ── Model definition ──────────────────────────────────────────────────────────
 
@@ -366,16 +430,21 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    iqr_k = prep_cfg["iqr_multiplier"]
-    mask  = pd.Series(True, index=df.index)
-    for col in pp_cols + [target_col]:
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-        iqr    = q3 - q1
-        if iqr > 0:
-            mask &= (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
-    n_removed = int((~mask).sum())
-    df = df[mask].copy()
-    print(f"Outliers removed  : {n_removed}  →  {len(df)} parts remaining")
+    # pp_cols are pre-cleaned by clean_data.py (X-outliers already removed).
+    # Apply IQR filter to target_col only (y-outlier removal on the full dataset).
+    iqr_k  = prep_cfg["iqr_multiplier"]
+    col    = target_col
+    q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+    iqr    = q3 - q1
+    if iqr > 0:
+        y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+    else:
+        y_mask = pd.Series(True, index=df.index)
+    y_removed_ids = df.index[~y_mask].tolist()
+    n_removed = int((~y_mask).sum())
+    df = df[y_mask].copy()
+    print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining"
+          + (f"  (IDs: {y_removed_ids})" if y_removed_ids else ""))
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
@@ -385,7 +454,7 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     print(f"pp features : {X_pp.shape[1]}   |   time steps : {X_pt.shape[1]}   |   samples : {len(y)}")
     print(f"Target      : mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
-    return part_ids, X_pp, X_pt, y, strat_labels
+    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols, y_removed_ids
 
 
 def run_cv(X_pp, X_pt, y, model_cfg: dict, train_cfg: dict,
@@ -467,23 +536,20 @@ def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
 
 def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str, plots_dir: Path):
     """Bar chart of per-fold indicative CV metrics (secondary output)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
-    fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(14, 4.5))
     fold_labels = [f"F{i + 1}" for i in range(K)] + ["Mean"]
-    bar_colors  = [C_BLUE] * K + [C_RED]
+    bar_colors  = [_PLT_C["fold"]] * K + [_PLT_C["fold_mean"]]
     for ax, metric in zip(axes, ["MAE", "RMSE", "R2", "MSE"]):
         vals = list(metrics_df[metric]) + [metrics_df[metric].mean()]
-        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="k", linewidth=0.4)
-        ax.set_title(f"{metric}", fontsize=10)
+        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="none", width=0.65)
+        ax.set_title(metric)
         ax.set_ylabel(metric)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.7)
-        ax.set_axisbelow(True)
+                    f"{v:.3f}", ha="center", va="bottom")
     fig.suptitle(f"[{material}] Indicative {K}-fold CV on dev set", fontsize=13)
     fig.tight_layout()
-    fig.savefig(plots_dir / "cv_metrics_folds.png", dpi=150)
+    fig.savefig(plots_dir / "cv_metrics_folds.png")
     plt.close(fig)
     print(f"CV plots saved → {plots_dir}")
 
@@ -491,61 +557,51 @@ def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str, plots_dir: Pa
 def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
                           final_metrics: dict, plots_dir: Path, material: str):
     """Scatter + residual plots from the final model on the held-out test set (primary output)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
-
-    # Scatter: real vs predicted
+    # Scatter: measured vs predicted
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(y_test, preds_test, alpha=0.7,
-               edgecolors="k", linewidths=0.3, color=C_BLUE, zorder=3)
+    ax.scatter(y_test, preds_test, color=_PLT_C["scatter"],
+               s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
     lo = min(y_test.min(), preds_test.min())
     hi = max(y_test.max(), preds_test.max())
-    ax.plot([lo, hi], [lo, hi], color=C_RED, linestyle="--",
-            linewidth=1.5, label="Ideal (1:1)")
-    ax.set_xlabel("Real weight [g]", fontsize=12)
-    ax.set_ylabel("Predicted weight [g]", fontsize=12)
+    ax.plot([lo, hi], [lo, hi], color=_PLT_C["ideal_line"], linestyle="--",
+            linewidth=1.5, label="Perfect prediction")
+    ax.set_xlabel("Measured weight [g]")
+    ax.set_ylabel("Predicted weight [g]")
     ax.set_title(
         f"[{material}] Final Model — Held-out Test Set\n"
         f"MAE={final_metrics['MAE']:.4f} g   R²={final_metrics['R2']:.4f}",
-        fontsize=12,
     )
-    ax.legend(fontsize=10)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(plots_dir / "scatter_final_test.png", dpi=150)
+    fig.savefig(plots_dir / "scatter_final_test.png")
     plt.close(fig)
 
     # Residuals: scatter vs predicted
     residuals = preds_test - y_test
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(preds_test, residuals, alpha=0.7,
-               edgecolors="k", linewidths=0.3, color=C_BLUE, zorder=3)
-    ax.axhline(0, color=C_RED, linestyle="--", linewidth=1.5)
-    ax.set_xlabel("Predicted weight [g]", fontsize=12)
-    ax.set_ylabel("Residual (pred − real) [g]", fontsize=12)
-    ax.set_title(f"[{material}] Residuals vs Predicted (final test)", fontsize=12)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
+    ax.scatter(preds_test, residuals, color=_PLT_C["residual"],
+               s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
+    ax.axhline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+    ax.set_xlabel("Predicted weight [g]")
+    ax.set_ylabel("Residual (pred − real) [g]")
+    ax.set_title(f"[{material}] Residuals vs Predicted (final test)")
     fig.tight_layout()
-    fig.savefig(plots_dir / "residuals_scatter_final_test.png", dpi=150)
+    fig.savefig(plots_dir / "residuals_scatter_final_test.png")
     plt.close(fig)
 
     # Residuals: histogram
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.hist(residuals, bins=20, color=C_BLUE, edgecolor="k",
-            linewidth=0.4, alpha=0.85)
-    ax.axvline(0, color=C_RED, linestyle="--", linewidth=1.5)
-    ax.axvline(float(residuals.mean()), color="#009E73", linestyle="-",
+    ax.hist(residuals, bins=20, color=_PLT_C["residual"], edgecolor="white", alpha=0.85)
+    ax.axvline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+    ax.axvline(float(residuals.mean()), color=_PLT_C["mean_line"], linestyle="-",
                linewidth=1.5, label=f"Mean={residuals.mean():.4f}")
-    ax.set_xlabel("Residual (pred − real) [g]", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
+    ax.set_xlabel("Residual (pred − real) [g]")
+    ax.set_ylabel("Count")
     ax.set_title(f"[{material}] Residuals Distribution (final test)\n"
-                 f"std={residuals.std():.4f} g", fontsize=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
+                 f"std={residuals.std():.4f} g")
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(plots_dir / "residuals_hist_final_test.png", dpi=150)
+    fig.savefig(plots_dir / "residuals_hist_final_test.png")
     plt.close(fig)
     print(f"Final test plots saved → {plots_dir}")
 
@@ -619,9 +675,10 @@ def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
         sss = StratifiedShuffleSplit(n_splits=1,
                                      test_size=train_cfg["val_fraction"],
                                      random_state=seed)
-        _tr, _val = next(sss.split(dev_idx, strat_labels[dev_idx]))
-        tr_idx  = dev_idx[_tr]
-        val_idx = dev_idx[_val]
+        rel = np.arange(len(dev_idx))
+        _tr_rel, _val_rel = next(sss.split(rel, strat_labels))
+        tr_idx  = dev_idx[_tr_rel]
+        val_idx = dev_idx[_val_rel]
     else:
         rng     = np.random.default_rng(seed)
         perm    = rng.permutation(len(dev_idx))
@@ -649,7 +706,7 @@ def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
         model, Xpp_tr, Xpt_tr, y[tr_idx],
         Xpp_val, Xpt_val, y[val_idx], final_tcfg, device)
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
-    return model, (pp_sc, pt_min, pt_max)
+    return model, (pp_sc, pt_min, pt_max), tr_idx, val_idx
 
 
 # ── Optuna HPO ────────────────────────────────────────────────────────────────
@@ -908,7 +965,7 @@ def main():
     for d in [out_dir, run_best_dir, overall_best_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    part_ids, X_pp, X_pt, y, strat_labels = load_data(data_cfg, prep_cfg)
+    part_ids, X_pp, X_pt, y, strat_labels, pp_cols, y_removed_ids = load_data(data_cfg, prep_cfg)
     n_pp, T = X_pp.shape[1], X_pt.shape[1]
 
     # ── Initial train/test split (done once; test data NEVER used in HPO or CV) ──
@@ -958,7 +1015,7 @@ def main():
     save_cv_plots(metrics_df, K, mat, run_best_dir)
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
-    final_model, final_scalers = final_train_m1(
+    final_model, final_scalers, tr_idx_final, val_idx_final = final_train_m1(
         X_pp, X_pt, y, dev_idx, model_cfg, train_cfg, seed, device, dev_strat)
     pp_sc, pt_min, pt_max = final_scalers
     Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], X_pt[test_idx], pp_sc, pt_min, pt_max)
@@ -991,6 +1048,36 @@ def main():
     (run_best_dir / "train_test_split.json").write_text(json.dumps(split_out, indent=2))
     print(f"Train/test split saved → {run_best_dir / 'train_test_split.json'}")
 
+    # Save data_processing.json — shared contract for M2 and Fusion
+    dp = {
+        "run_ts":         _RUN_TS,
+        "id_col":         data_cfg["id_col"],
+        "random_seed":    seed,
+        "pp_cols":        pp_cols,
+        "train_part_ids": part_ids[tr_idx_final].tolist(),
+        "val_part_ids":   part_ids[val_idx_final].tolist(),
+        "test_part_ids":  part_ids[test_idx].tolist(),
+        "pp_sc":          _scaler_to_dict(pp_sc),
+        "pt_min":         float(pt_min),
+        "pt_max":         float(pt_max),
+        "y_filter": {
+            "target_col":    data_cfg["target_col"],
+            "iqr_multiplier": prep_cfg["iqr_multiplier"],
+            "removed_ids":   y_removed_ids,
+        },
+    }
+    (run_best_dir / "data_processing.json").write_text(json.dumps(dp, indent=2))
+    print(f"Data processing saved → {run_best_dir / 'data_processing.json'}")
+
+    # Save run_info.json — lightweight run identifier for users
+    run_info = {
+        "run_ts":       _RUN_TS,
+        "material":     mat,
+        "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
+    }
+    (run_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
+    print(f"Run info saved → {run_best_dir / 'run_info.json'}")
+
     if overall_updated:
         save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat)
@@ -998,6 +1085,9 @@ def main():
         metrics_df.to_csv(overall_best_dir / "cv_fold_metrics.csv")
         shutil.copy2(run_best_dir / "train_test_split.json",
                      overall_best_dir / "train_test_split.json")
+        shutil.copy2(run_best_dir / "data_processing.json",
+                     overall_best_dir / "data_processing.json")
+        (overall_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
         df_f.index.name = data_cfg["id_col"]
         df_f.to_csv(overall_best_dir / "pressure_features_f.csv")
         if mode == "optuna" and best_hpo is not None:

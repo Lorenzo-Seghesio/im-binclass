@@ -53,12 +53,15 @@ Outputs (under outputs/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
   residuals_hist_test.png        Residuals histogram
   feature_attributions.csv       Per-feature mean |attribution| for all XAI methods
   shap_values.csv                Per-sample SHAP values  (N_test × 20 cols)
-  ig_values.csv                  Per-sample IG values    (N_test × 20 cols)
+  eg_values.csv                  Per-sample EG values    (N_test × 20 cols)
   jacobian_values.csv            Per-sample Jacobian values (N_test × 20 cols)
   ih_matrix.csv                  Mean Integrated-Hessians matrix (20 × 20)
   xai_bar_{method}.png           Stacked bar: mean |attr| direct + indirect
   xai_total_effect.png           Total (direct + indirect) per feature, all methods
   ih_heatmap.png                 IH interaction matrix heat-map
+  xai_m1merge_bar_{shap|ig}.png  M1-merge attribution: f features vs pp_direct (sorted)
+  shap_m1merge_values.csv        M1-merge SHAP values (N_test × (n_f + n_pp) cols)
+  eg_m1merge_values.csv          M1-merge EG values   (N_test × (n_f + n_pp) cols)
   fusion_model_info.json         Architecture + scaler info + which model files used
   m1_best_model.pt  /  m2_best_model.pt   (copies of used model weights)
   m1_best_metrics.json / m2_best_metrics.json
@@ -77,6 +80,58 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ── Publication plot style ────────────────────────────────────────────────────
+_PLT_C: dict = {
+    "scatter":    "#2166AC",   # steel blue   — scatter dots / predictions
+    "ideal_line": "#B2182B",   # muted red    — 1:1 diagonal reference
+    "residual":   "#1B7837",   # forest green — residual scatter & histogram
+    "mean_line":  "#1B7837",   # forest green — mean residual vline
+    "zero_line":  "#555555",   # dark grey    — y = 0 reference
+    "fold":       "#4393C3",   # light blue   — per-fold CV bars
+    "fold_mean":  "#D6604D",   # coral        — mean CV bar
+    "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "ig":         "#7D54A4",   # purple       — Expected Gradients (EG) bars
+    "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
+    "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
+    "total":      "#1B7837",   # green        — total combined attribution
+    "f_feat":     "#E69F00",   # gold         — M1-merge f encoder features
+    "pp_feat":    "#2166AC",   # blue         — M1-merge pp_direct features
+    "pressure":   "#2166AC",   # blue         — GradCAM pressure curve
+    "gradcam":    "#B2182B",   # red          — GradCAM activation overlay
+}
+
+
+def _strip_prefix(name: str) -> str:
+    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+        if name.startswith(pfx):
+            return name[len(pfx):]
+    return name
+
+
+def _strip_prefixes(names) -> list:
+    return [_strip_prefix(n) for n in names]
+
+
+plt.rcParams.update({
+    "font.family": "sans-serif", "font.size": 10,
+    "axes.labelsize": 11, "axes.titlesize": 12,
+    "axes.titleweight": "bold", "axes.titlepad": 10,
+    "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.8,
+    "axes.grid": True, "grid.color": "#E0E0E0", "grid.linestyle": "--",
+    "grid.linewidth": 0.5, "axes.axisbelow": True,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.size": 3.5, "ytick.major.size": 3.5,
+    "xtick.major.width": 0.7, "ytick.major.width": 0.7,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+    "savefig.facecolor": "white", "legend.framealpha": 0.92,
+    "legend.edgecolor": "#CCCCCC", "legend.frameon": True,
+    "lines.linewidth": 1.8, "patch.linewidth": 0.4,
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 import numpy as np
 import pandas as pd
 import torch
@@ -87,6 +142,42 @@ from sklearn.preprocessing import MinMaxScaler
 warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _dict_to_scaler(d: dict) -> MinMaxScaler:
+    """Reconstruct a MinMaxScaler from a saved dict."""
+    sc = MinMaxScaler(feature_range=tuple(d["feature_range"]))
+    sc.data_min_       = np.array(d["data_min_"],  dtype=np.float64)
+    sc.data_max_       = np.array(d["data_max_"],  dtype=np.float64)
+    sc.scale_          = np.array(d["scale_"],     dtype=np.float64)
+    sc.min_            = np.array(d["min_"],        dtype=np.float64)
+    sc.n_features_in_  = len(d["data_min_"])
+    sc.n_samples_seen_ = 0
+    return sc
+
+
+def _check_scalers_close(sc_a: MinMaxScaler, sc_b: MinMaxScaler,
+                         label: str = "", rtol: float = 1e-4) -> bool:
+    """Warn if two fitted MinMaxScalers differ beyond rtol.
+
+    Returns True when they match, False (+ warning) when they diverge.
+    """
+    attrs = ("data_min_", "data_max_", "scale_", "min_")
+    ok = all(
+        np.allclose(getattr(sc_a, a), getattr(sc_b, a), rtol=rtol, atol=1e-6)
+        for a in attrs
+    )
+    tag = f"  [{label}] " if label else "  "
+    if ok:
+        print(f"{tag}Scaler consistency check PASSED ✓")
+    else:
+        print(f"[WARN]{tag}Scaler consistency check FAILED — "
+              f"M1 pp_sc and M2 reconstructed x_sc differ (rtol={rtol}).\n"
+              f"  This may indicate different preprocessing between M1 and M2.\n"
+              f"  M1 data_min_={sc_a.data_min_}\n"
+              f"  M2 data_min_={sc_b.data_min_}")
+    return ok
+
 
 # ── Check optional XAI dependencies ──────────────────────────────────────────
 try:
@@ -331,15 +422,79 @@ class FlatFusionWrapper(nn.Module):
         return self.fusion(pp_ind, pp_dir)
 
 
+class M1MergeWrapper(nn.Module):
+    """M1-path XAI wrapper: accepts (B, n_f + n_pp) input.
+
+    First n_f columns  = f_full (encoder feature space, M2 predictions embedded
+                         in n_f-dimensional vector via _compute_f_full).
+    Last  n_pp columns = pp_direct (raw, unscaled process parameters).
+
+    Passes pp_direct through M1's pp_sc → PPMLP, concatenates with f_full,
+    then through MergeHead → W.  Enables independent gradient attribution to
+    each f_i feature and each pp_i feature, revealing which encoder features
+    matter most to the weight-prediction head.
+    """
+
+    def __init__(self, fusion: FusionModel, n_f: int, n_pp: int):
+        super().__init__()
+        self.fusion = fusion
+        self.n_f    = n_f
+        self.n_pp   = n_pp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f_full    = x[:, :self.n_f]                          # (B, n_f)
+        pp_raw    = x[:, self.n_f:]                          # (B, n_pp)
+        pp_scaled = self.fusion.m1_x_sc.transform(pp_raw)   # MinMax scale
+        pp_out    = self.fusion.pp_mlp(pp_scaled)            # (B, pp_hidden[-1])
+        merged    = torch.cat([f_full, pp_out], dim=1)       # (B, n_f + pp_hidden[-1])
+        return self.fusion.merge(merged)                     # (B,)
+
+
+def _compute_f_full(fusion: FusionModel, X_pp: np.ndarray,
+                    device: torch.device) -> np.ndarray:
+    """Pass raw process parameters through M2 → inverse-scale → embed in n_f vector.
+    Returns f_full (N, n_f) numpy array (detached, no gradients).
+    Inactive f positions (not in fusion.f_positions) are set to zero.
+    """
+    fusion.eval()
+    with torch.no_grad():
+        pp_t   = torch.tensor(X_pp, dtype=torch.float32, device=device)
+        pp_s   = fusion.m2_x_sc.transform(pp_t)
+        f_sc   = fusion.m2(pp_s)
+        f_orig = fusion.m2_y_sc.inverse_transform(f_sc)
+        B      = X_pp.shape[0]
+        parts  = []
+        m2_col = 0
+        for i in range(fusion.n_f):
+            if i in fusion.f_positions:
+                parts.append(f_orig[:, m2_col : m2_col + 1])
+                m2_col += 1
+            else:
+                parts.append(torch.zeros(B, 1, device=device, dtype=torch.float32))
+        f_full = torch.cat(parts, dim=1)   # (B, n_f)
+    return f_full.cpu().numpy()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Data loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_scalar_data(material: str, iqr_multiplier: float = 1.5,
-                     filter_target: bool = True):
-    """Load scalar_features_{material}.csv; impute + IQR-filter; return DataFrame."""
+def load_scalar_data(material: str):
+    """Load scalar_features_{material}_clean.csv; impute; return DataFrame.
+
+    X-outliers are pre-removed by clean_data.py.  y-outlier filtering is
+    applied separately in main() using the y_filter section of M1's
+    data_processing.json so that Fusion uses the exact same parts as M1.
+    """
     csv_path = (BASE_DIR / "data" / "Fraunhofer_ProBayes_Dataset"
-                / "extracted" / f"scalar_features_{material}.csv")
+                / "extracted" / f"scalar_features_{material}_clean.csv")
+    if not csv_path.exists():
+        # Fallback to raw file with a warning (for backward compatibility)
+        csv_path = (BASE_DIR / "data" / "Fraunhofer_ProBayes_Dataset"
+                    / "extracted" / f"scalar_features_{material}.csv")
+        print(f"[warn] _clean.csv not found — falling back to raw CSV: {csv_path.name}")
+        print("       Run 'python src/Utility/clean_data.py --material "
+              f"{material}' first.")
     if not csv_path.exists():
         raise FileNotFoundError(f"Scalar CSV not found: {csv_path}")
 
@@ -352,22 +507,7 @@ def load_scalar_data(material: str, iqr_multiplier: float = 1.5,
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    # IQR outlier removal
-    cols_to_filter = pp_cols + ([target_col] if filter_target else [])
-    mask = pd.Series(True, index=df.index)
-    for col in cols_to_filter:
-        if col not in df.columns:
-            continue
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-        iqr = q3 - q1
-        if iqr > 0:
-            mask &= (df[col] >= q1 - iqr_multiplier * iqr) & \
-                    (df[col] <= q3 + iqr_multiplier * iqr)
-
-    n_removed = int((~mask).sum())
-    df = df[mask].copy()
-    print(f"  Loaded {len(df)} parts  (removed {n_removed} outliers, "
-          f"filter_target={filter_target})")
+    print(f"  Loaded {len(df)} parts from {csv_path.name}")
     return df, pp_cols, target_col
 
 
@@ -401,7 +541,9 @@ def map_split(split_data: dict, part_ids: np.ndarray):
 
 def reconstruct_m1_pp_scaler(X_pp: np.ndarray, dev_idx: np.ndarray,
                               seed: int = 42, val_fraction: float = 0.1):
-    """Replicate M1 final_train_m1 scaler fitting exactly (seed, val_fraction)."""
+    """Replicate M1 final_train_m1 scaler fitting exactly (seed, val_fraction).
+    Used as fallback when data_processing.json is not available.
+    """
     rng   = np.random.default_rng(seed)
     perm  = rng.permutation(len(dev_idx))
     n_val = max(1, int(len(dev_idx) * val_fraction))
@@ -416,7 +558,9 @@ def reconstruct_m1_pp_scaler(X_pp: np.ndarray, dev_idx: np.ndarray,
 def reconstruct_m2_scalers(X_pp: np.ndarray, Y_f: np.ndarray,
                             dev_idx: np.ndarray,
                             seed: int = 42, val_fraction: float = 0.1):
-    """Replicate M2 final_train_m2 scaler fitting (x_sc + y_sc)."""
+    """Replicate M2 final_train_m2 scaler fitting (x_sc + y_sc).
+    Used as fallback when scalers.json is not available.
+    """
     rng   = np.random.default_rng(seed)
     perm  = rng.permutation(len(dev_idx))
     n_val = max(1, int(len(dev_idx) * val_fraction))
@@ -426,6 +570,112 @@ def reconstruct_m2_scalers(X_pp: np.ndarray, Y_f: np.ndarray,
     y_sc = MinMaxScaler(); y_sc.fit(Y_f[tr_idx])
     print(f"  M2 x_sc/y_sc reconstructed on {len(tr_idx)} dev-train samples")
     return x_sc, y_sc
+
+
+def load_m1_data_for_fusion(m1_dir: Path, part_ids: np.ndarray):
+    """Load M1's train/test split indices and pp_sc from data_processing.json.
+
+    Falls back to load_train_test_split + None for pp_sc when the file is absent.
+    Returns (dev_idx, test_idx, m1_pp_sc, m1_run_ts).
+    m1_pp_sc is None in the fallback case (caller must reconstruct if needed).
+    """
+    dp_path   = m1_dir / "data_processing.json"
+    id_to_idx = {pid: i for i, pid in enumerate(part_ids.tolist())}
+
+    if dp_path.exists():
+        dp        = json.loads(dp_path.read_text())
+        dev_ids   = dp["train_part_ids"] + dp["val_part_ids"]
+        dev_idx   = np.array([id_to_idx[p] for p in dev_ids          if p in id_to_idx], dtype=np.intp)
+        test_idx  = np.array([id_to_idx[p] for p in dp["test_part_ids"] if p in id_to_idx], dtype=np.intp)
+        m1_pp_sc  = _dict_to_scaler(dp["pp_sc"])
+        m1_run_ts = dp.get("run_ts", "unknown")
+        print(f"  M1 data_processing.json loaded  "
+              f"→  dev={len(dev_idx)}  test={len(test_idx)}  run_ts={m1_run_ts}")
+        return dev_idx, test_idx, m1_pp_sc, m1_run_ts
+
+    print("[warn] M1 data_processing.json not found — falling back to train_test_split.json")
+    split_data = load_train_test_split(m1_dir)
+    dev_idx, test_idx = map_split(split_data, part_ids)
+    m1_run_ts = "unknown"
+    ri_path = m1_dir / "run_info.json"
+    if ri_path.exists():
+        m1_run_ts = json.loads(ri_path.read_text()).get("run_ts", "unknown")
+    return dev_idx, test_idx, None, m1_run_ts
+
+
+def load_m2_y_sc_for_fusion(m2_dir: Path):
+    """Load M2's y_sc from scalers.json.
+
+    Returns y_sc (MinMaxScaler) or None when scalers.json is absent (caller reconstructs).
+    """
+    sc_path = m2_dir / "scalers.json"
+    if sc_path.exists():
+        sc_info = json.loads(sc_path.read_text())
+        y_sc    = _dict_to_scaler(sc_info["y_sc"])
+        print(f"  M2 scalers.json loaded  (m1_run_ts={sc_info.get('m1_run_ts', '?')})")
+        return y_sc
+    print("[warn] M2 scalers.json not found — y_sc will be reconstructed")
+    return None
+
+
+def _check_m1_m2_coherence(m1_dir: Path, m2_dir: Path) -> None:
+    """Verify that M2 was trained on the same M1 run that Fusion will use.
+
+    Reads:
+      m1_dir/data_processing.json  → "run_ts"    (M1 unique run timestamp)
+      m2_dir/scalers.json          → "m1_run_ts" (M1 run_ts recorded by M2)
+
+    If both values are present and differ, prints a warning with both
+    timestamps and prompts the user to confirm before continuing.
+    If either file is missing or either timestamp is "unknown" the check
+    degrades to a soft warning (no prompt) so old runs are not broken.
+    """
+    # --- Read M1 run_ts ---
+    dp_path = m1_dir / "data_processing.json"
+    if not dp_path.exists():
+        print("[warn] Coherence check skipped — M1 data_processing.json not found")
+        return
+    m1_ts = json.loads(dp_path.read_text()).get("run_ts", "unknown")
+
+    # --- Read M2's recorded m1_run_ts ---
+    sc_path = m2_dir / "scalers.json"
+    if not sc_path.exists():
+        print("[warn] Coherence check skipped — M2 scalers.json not found")
+        return
+    m2_recorded_ts = json.loads(sc_path.read_text()).get("m1_run_ts", "unknown")
+
+    # --- Compare ---
+    if "unknown" in (m1_ts, m2_recorded_ts):
+        print(
+            f"[warn] Coherence check: cannot verify — "
+            f"M1 run_ts={m1_ts!r}, M2 recorded m1_run_ts={m2_recorded_ts!r}"
+        )
+        return
+
+    if m1_ts == m2_recorded_ts:
+        print(f"  M1 ↔ M2 coherence OK  (run_ts={m1_ts})")
+        return
+
+    # --- Mismatch ---
+    print(
+        "\n" + "!" * 70 + "\n"
+        "  [COHERENCE WARNING]  M2 was NOT trained on the current M1 run.\n"
+        f"  M1 run_ts            : {m1_ts}\n"
+        f"  M2 was trained on    : {m2_recorded_ts}\n"
+        "  Fusion may produce incorrect results because the encoder features\n"
+        "  and scalers are from different training runs.\n"
+        "  Recommended action   : re-run M2 → then re-run Fusion.\n"
+        + "!" * 70
+    )
+    # Prompt — default to 'y' when stdin is not a terminal (batch jobs)
+    if sys.stdin.isatty():
+        answer = input("\nContinue anyway? [y/N] ").strip().lower()
+    else:
+        print("[warn] Non-interactive session — defaulting to 'y' (continuing).")
+        answer = "y"
+    if answer != "y":
+        sys.exit("[ABORT] Fusion stopped. Re-run M2 first, then re-run Fusion.")
+    print("[warn] Continuing despite coherence mismatch — results may be unreliable.\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -501,10 +751,11 @@ def get_f_positions(m1_dir: Path, m2_f_cols: list) -> list:
 def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
                     device: torch.device) -> dict:
     """Forward test data through FusionModel; return metrics + predictions."""
-    t_pp = torch.tensor(X_pp, dtype=torch.float32, device=device)
+    t_pp_indirect = torch.tensor(X_pp, dtype=torch.float32, device=device)
+    t_pp_direct   = t_pp_indirect.clone()   # separate tensor so gradients never mix
     fusion.eval()
     with torch.no_grad():
-        preds = fusion(t_pp, t_pp).cpu().numpy()
+        preds = fusion(t_pp_indirect, t_pp_direct).cpu().numpy()
     mae  = float(mean_absolute_error(y, preds))
     mse  = float(mean_squared_error(y, preds))
     rmse = math.sqrt(mse)
@@ -580,29 +831,40 @@ def run_shap(flat_model: FlatFusionWrapper,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Vanilla Integrated Gradients (captum)
+# Expected Gradients  (captum IntegratedGradients averaged over random baselines)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_ig(flat_model: FlatFusionWrapper,
+           X_bg_flat:  np.ndarray,
            X_test_flat: np.ndarray,
-           baseline_flat: np.ndarray,
            n_steps: int,
-           device: torch.device) -> np.ndarray:
-    """Run captum IntegratedGradients; return ig_values (N_test, 2*n_pp)."""
+           n_eg_bg: int,
+           device: torch.device) -> np.ndarray | None:
+    """Expected Gradients: captum IG averaged over n_eg_bg baselines sampled from X_bg_flat.
+    Returns eg_values (N_test, 2*n_pp) or None if captum unavailable.
+    """
     if not _HAS_CAPTUM:
         print("  [SKIP] captum not available")
         return None
 
-    print(f"  Running Integrated Gradients  (steps={n_steps}) ...")
+    K = min(n_eg_bg, len(X_bg_flat))
+    print(f"  Running Expected Gradients  (steps={n_steps}, baselines={K}) ...")
+    rng    = np.random.default_rng(0)
+    bl_idx = rng.choice(len(X_bg_flat), size=K, replace=False)
+
     flat_model.eval()
-    ig = IntegratedGradients(flat_model)
-    x_t  = torch.tensor(X_test_flat.astype(np.float32), dtype=torch.float32, device=device)
-    bl_t = torch.tensor(baseline_flat.astype(np.float32)[None, :], dtype=torch.float32,
-                        device=device).expand_as(x_t)
-    attr = ig.attribute(x_t, baselines=bl_t, n_steps=n_steps, internal_batch_size=64)
-    ig_vals = attr.detach().cpu().numpy()
-    print(f"  IG done  shape={ig_vals.shape}")
-    return ig_vals
+    ig  = IntegratedGradients(flat_model)
+    x_t = torch.tensor(X_test_flat.astype(np.float32), dtype=torch.float32, device=device)
+
+    eg_acc = np.zeros_like(X_test_flat)
+    for k in range(K):
+        bl      = torch.tensor(X_bg_flat[bl_idx[k]:bl_idx[k]+1].astype(np.float32),
+                               dtype=torch.float32, device=device).expand_as(x_t)
+        attr    = ig.attribute(x_t, baselines=bl, n_steps=n_steps, internal_batch_size=64)
+        eg_acc += attr.detach().cpu().numpy()
+    eg_vals = eg_acc / K
+    print(f"  Expected Gradients done  shape={eg_vals.shape}")
+    return eg_vals
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -706,71 +968,146 @@ def run_jacobian(flat_model: FlatFusionWrapper,
     return jac_np
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# M1-merge XAI (f features + pp_direct → W)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_shap_m1merge(m1_wrap: M1MergeWrapper,
+                     X_dev_m1:  np.ndarray,
+                     X_test_m1: np.ndarray,
+                     n_bg:      int,
+                     device:    torch.device) -> np.ndarray | None:
+    """SHAP GradientExplainer on M1MergeWrapper.
+    Returns shap_values (N_test, n_f + n_pp) or None if shap unavailable.
+    """
+    if not _HAS_SHAP:
+        print("  [SKIP] SHAP not available")
+        return None
+    print(f"  Running M1-merge SHAP  "
+          f"(background: {min(n_bg, len(X_dev_m1))} samples) ...")
+    rng    = np.random.default_rng(1)
+    bg_idx = rng.choice(len(X_dev_m1), size=min(n_bg, len(X_dev_m1)), replace=False)
+    bg_t   = torch.tensor(X_dev_m1[bg_idx].astype(np.float32),
+                           dtype=torch.float32, device=device)
+    x_t    = torch.tensor(X_test_m1.astype(np.float32),
+                           dtype=torch.float32, device=device)
+    shap_model = _ShapWrapper(m1_wrap).to(device)
+    shap_model.eval()
+    e  = shap_lib.GradientExplainer(shap_model, bg_t)
+    sv = e.shap_values(x_t)
+    if isinstance(sv, list):
+        sv = sv[0]
+    sv = np.array(sv, dtype=np.float32)
+    if sv.ndim == 3:
+        sv = sv[..., 0]
+    print(f"  M1-merge SHAP done  shape={sv.shape}")
+    return sv
+
+
+def run_ig_m1merge(m1_wrap:   M1MergeWrapper,
+                   X_bg_m1:   np.ndarray,
+                   X_test_m1: np.ndarray,
+                   n_steps:   int,
+                   n_eg_bg:   int,
+                   device:    torch.device) -> np.ndarray | None:
+    """Expected Gradients (captum) on M1MergeWrapper.
+    Returns eg_values (N_test, n_f + n_pp) or None if captum unavailable.
+    Averages IG over n_eg_bg baselines sampled from X_bg_m1 (dev set).
+    """
+    if not _HAS_CAPTUM:
+        print("  [SKIP] captum not available")
+        return None
+
+    K = min(n_eg_bg, len(X_bg_m1))
+    print(f"  Running M1-merge Expected Gradients  (steps={n_steps}, baselines={K}) ...")
+    rng    = np.random.default_rng(1)
+    bl_idx = rng.choice(len(X_bg_m1), size=K, replace=False)
+
+    m1_wrap.eval()
+    ig  = IntegratedGradients(m1_wrap)
+    x_t = torch.tensor(X_test_m1.astype(np.float32), dtype=torch.float32, device=device)
+
+    eg_acc = np.zeros_like(X_test_m1)
+    for k in range(K):
+        bl      = torch.tensor(X_bg_m1[bl_idx[k]:bl_idx[k]+1].astype(np.float32),
+                               dtype=torch.float32, device=device).expand_as(x_t)
+        attr    = ig.attribute(x_t, baselines=bl, n_steps=n_steps, internal_batch_size=64)
+        eg_acc += attr.detach().cpu().numpy()
+    eg_vals = eg_acc / K
+    print(f"  M1-merge Expected Gradients done  shape={eg_vals.shape}")
+    return eg_vals
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Plotting
 # ══════════════════════════════════════════════════════════════════════════════
 
-C_IND  = "#D55E00"   # indirect (orange)
-C_DIR  = "#0072B2"   # direct   (blue)
-C_TOT  = "#009E73"   # total    (green)
-C_RED  = "#CC3311"
-C_BLUE = "#0072B2"
-
-
 def _save_scatter(y_true, y_pred, metrics, out_path: Path, material: str):
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(y_true, y_pred, alpha=0.7, edgecolors="k",
-               linewidths=0.3, color=C_BLUE, zorder=3)
+    ax.scatter(y_true, y_pred, color=_PLT_C["scatter"],
+               s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
     lo = min(y_true.min(), y_pred.min())
     hi = max(y_true.max(), y_pred.max())
-    ax.plot([lo, hi], [lo, hi], color=C_RED, linestyle="--", linewidth=1.5)
-    ax.set_xlabel("Real weight [g]"); ax.set_ylabel("Predicted weight [g]")
+    ax.plot([lo, hi], [lo, hi], color=_PLT_C["ideal_line"], linestyle="--",
+            linewidth=1.5, label="Perfect prediction")
+    ax.set_xlabel("Measured weight [g]")
+    ax.set_ylabel("Predicted weight [g]")
     ax.set_title(f"[{material}] Fusion Model — Test Set\n"
                  f"MAE={metrics['MAE']:.4f} g   R²={metrics['R2']:.4f}")
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7); ax.set_axisbelow(True)
-    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def _save_residuals_scatter(y_true, y_pred, out_path: Path, material: str):
     res = y_pred - y_true
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(y_pred, res, alpha=0.7, edgecolors="k",
-               linewidths=0.3, color=C_BLUE, zorder=3)
-    ax.axhline(0, color=C_RED, linestyle="--", linewidth=1.5)
-    ax.set_xlabel("Predicted weight [g]"); ax.set_ylabel("Residual (pred − real) [g]")
+    ax.scatter(y_pred, res, color=_PLT_C["residual"],
+               s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
+    ax.axhline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+    ax.set_xlabel("Predicted weight [g]")
+    ax.set_ylabel("Residual (pred − real) [g]")
     ax.set_title(f"[{material}] Residuals vs Predicted")
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7); ax.set_axisbelow(True)
-    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def _save_residuals_hist(y_true, y_pred, out_path: Path, material: str):
     res = y_pred - y_true
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.hist(res, bins=20, color=C_BLUE, edgecolor="k", linewidth=0.4, alpha=0.85)
-    ax.axvline(0, color=C_RED, linestyle="--", linewidth=1.5)
-    ax.axvline(float(res.mean()), color=C_TOT, linestyle="-", linewidth=1.5,
+    ax.hist(res, bins=20, color=_PLT_C["residual"], edgecolor="white", alpha=0.85)
+    ax.axvline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+    ax.axvline(float(res.mean()), color=_PLT_C["mean_line"], linestyle="-", linewidth=1.5,
                label=f"Mean={res.mean():.4f}")
-    ax.set_xlabel("Residual [g]"); ax.set_ylabel("Count")
+    ax.set_xlabel("Residual [g]")
+    ax.set_ylabel("Count")
     ax.set_title(f"[{material}] Residuals Distribution\nstd={res.std():.4f} g")
-    ax.legend(); ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    ax.set_axisbelow(True)
-    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
                           pp_cols: list, title: str, out_path: Path):
     """Stacked horizontal bar: indirect (left) + direct (right)."""
+    labels = _strip_prefixes(pp_cols)
     n  = len(pp_cols)
     y  = np.arange(n)
     fig, ax = plt.subplots(figsize=(9, max(4, n * 0.45)))
-    ax.barh(y, mean_abs_ind, label="Indirect (via M2)", color=C_IND, alpha=0.85)
+    ax.barh(y, mean_abs_ind, label="Indirect (via M2)", color=_PLT_C["indirect"], alpha=0.85)
     ax.barh(y, mean_abs_dir, left=mean_abs_ind, label="Direct (via PPMLP)",
-            color=C_DIR, alpha=0.85)
-    ax.set_yticks(y); ax.set_yticklabels(pp_cols, fontsize=9)
-    ax.set_xlabel("Mean |attribution|"); ax.set_title(title)
-    ax.legend(fontsize=9); ax.grid(True, axis="x", linestyle="--", alpha=0.6)
-    ax.set_axisbelow(True)
-    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+            color=_PLT_C["direct"], alpha=0.85)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Mean |attribution|")
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def save_xai_bars(summary_df: pd.DataFrame, pp_cols: list, out_dir: Path,
@@ -794,13 +1131,36 @@ def save_xai_bars(summary_df: pd.DataFrame, pp_cols: list, out_dir: Path,
     print(f"  XAI bar plots saved → {out_dir}")
 
 
+def save_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
+                      pp_cols: list, out_dir: Path, material: str, n_pp: int):
+    """SHAP beeswarm (dot) plot — total effect (indirect + direct) per feature.
+
+    shap_vals : (N_test, 2*n_pp)  — first n_pp = indirect, last n_pp = direct
+    X_test    : (N_test, n_pp)    — raw feature values (for dot colouring)
+    """
+    if not _HAS_SHAP:
+        return
+    try:
+        # Total attribution per feature per sample
+        shap_total = shap_vals[:, :n_pp] + shap_vals[:, n_pp:]  # (N, n_pp)
+        shap_lib.summary_plot(shap_total, X_test,
+                              feature_names=_strip_prefixes(pp_cols),
+                              plot_type="dot", show=False)
+        plt.title(f"[{material}] SHAP beeswarm — total effect (direct + indirect)")
+        out_path = out_dir / "xai_shap_beeswarm.png"
+        plt.savefig(out_path)
+        plt.close()
+        print(f"  SHAP beeswarm saved → {out_path}")
+    except Exception as exc:
+        print(f"  [warn] SHAP beeswarm failed: {exc}")
+
+
 def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
                            out_dir: Path, material: str):
     """Grouped bar: total effect per feature per method."""
     method_cols = {
-        "SHAP":     "shap_total_mean_abs",
-        "IG":       "ig_total_mean_abs",
-        "Jacobian": "jac_total_mean_abs",
+        "SHAP": "shap_total_mean_abs",
+        "EG":   "eg_total_mean_abs",
     }
     available = {k: v for k, v in method_cols.items() if v in summary_df.columns}
     if not available:
@@ -808,21 +1168,21 @@ def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
     n = len(pp_cols)
     x = np.arange(n)
     w = 0.8 / len(available)
-    colours = [C_IND, C_DIR, C_TOT]
+    colours = [_PLT_C["shap"], _PLT_C["ig"]]
+    labels  = _strip_prefixes(pp_cols)
 
-    fig, ax = plt.subplots(figsize=(12, max(4, n * 0.4)))
+    fig, ax = plt.subplots(figsize=(max(10, n * 0.7), max(4, n * 0.4)))
     for i, (label, col) in enumerate(available.items()):
         offset = (i - (len(available) - 1) / 2) * w
         ax.bar(x + offset, summary_df[col].values, w, label=label,
-               color=colours[i % len(colours)], edgecolor="k", linewidth=0.3)
+               color=colours[i % len(colours)], edgecolor="none")
     ax.set_xticks(x)
-    ax.set_xticklabels(pp_cols, rotation=45, ha="right", fontsize=9)
+    ax.set_xticklabels(labels, rotation=35, ha="right")
     ax.set_ylabel("Mean |total attribution|")
     ax.set_title(f"[{material}] Total Feature Effect (direct + indirect) — All Methods")
-    ax.legend(); ax.grid(True, axis="y", linestyle="--", alpha=0.6)
-    ax.set_axisbelow(True)
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "xai_total_effect.png", dpi=150)
+    fig.savefig(out_dir / "xai_total_effect.png")
     plt.close(fig)
     print(f"  Total-effect plot saved → {out_dir / 'xai_total_effect.png'}")
 
@@ -835,15 +1195,75 @@ def save_ih_heatmap(ih_matrix: np.ndarray, flat_cols: list, out_path: Path,
     vmax = np.abs(ih_matrix).max()
     im = ax.imshow(ih_matrix, cmap="RdBu_r", aspect="auto",
                    vmin=-vmax, vmax=vmax)
+    labels = _strip_prefixes(flat_cols)
     ax.set_xticks(range(d)); ax.set_yticks(range(d))
-    ax.set_xticklabels(flat_cols, rotation=90, fontsize=7)
-    ax.set_yticklabels(flat_cols, fontsize=7)
+    ax.set_xticklabels(labels, rotation=90)
+    ax.set_yticklabels(labels)
     ax.set_title(f"[{material}] Integrated Hessians — mean interaction matrix")
     plt.colorbar(im, ax=ax, shrink=0.7, label="IH value")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path)
     plt.close(fig)
     print(f"  IH heatmap saved → {out_path}")
+
+
+def save_xai_m1merge_bars(shap_m1: np.ndarray | None, ig_m1: np.ndarray | None,
+                           m1merge_cols: list, n_f: int,
+                           out_dir: Path, material: str):
+    """Horizontal bar plots for M1-merge XAI.
+
+    Colour coding:
+      amber (#E69F00) = f features (M2 output, encoder space)
+      blue  (#0072B2) = pp_direct features (raw process parameters)
+    Features sorted ascending by mean |attribution|.
+    Inactive f positions (zeros by construction) will naturally sort to the bottom.
+    """
+    import matplotlib.patches as mpatches
+    C_F  = _PLT_C["f_feat"]
+    C_PP = _PLT_C["pp_feat"]
+    for tag, vals, label in [("shap", shap_m1, "SHAP"), ("eg", ig_m1, "EG")]:
+        if vals is None:
+            continue
+        mean_abs       = np.abs(vals).mean(axis=0)            # (n_f + n_pp,)
+        colours        = [C_F if i < n_f else C_PP for i in range(len(m1merge_cols))]
+        display_labels = list(m1merge_cols[:n_f]) + _strip_prefixes(m1merge_cols[n_f:])
+        order          = np.argsort(mean_abs)                 # ascending
+        fig, ax        = plt.subplots(figsize=(9, max(4, len(m1merge_cols) * 0.35 + 1)))
+        ax.barh([display_labels[i] for i in order],
+                mean_abs[order],
+                color=[colours[i] for i in order],
+                edgecolor="none")
+        ax.set_xlabel("Mean |attribution|")
+        ax.set_title(f"[{material}] M1-merge {label} — encoder f features vs pp_direct")
+        ax.legend(handles=[
+            mpatches.Patch(facecolor=C_F,  edgecolor="none",
+                           label="f features (M2 output, encoder space)"),
+            mpatches.Patch(facecolor=C_PP, edgecolor="none",
+                           label="pp_direct (raw process parameters)"),
+        ])
+        fig.tight_layout()
+        out_path = out_dir / f"xai_m1merge_bar_{tag}.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"  M1-merge {label} bar saved → {out_path}")
+
+    # Beeswarm for M1-merge SHAP (feature values = pp_direct part only for colouring)
+    if shap_m1 is not None and _HAS_SHAP:
+        try:
+            # Use only the pp_direct columns for feature value colouring
+            # (f features are abstract latent dims, not meaningful raw values)
+            pp_shap = shap_m1[:, n_f:]                        # (N, n_pp)
+            pp_feat_names = _strip_prefixes(m1merge_cols[n_f:])
+            shap_lib.summary_plot(pp_shap, pp_shap,
+                                  feature_names=pp_feat_names,
+                                  plot_type="dot", show=False)
+            plt.title(f"[{material}] M1-merge SHAP beeswarm — pp_direct features")
+            out_path = out_dir / "xai_m1merge_shap_beeswarm.png"
+            plt.savefig(out_path)
+            plt.close()
+            print(f"  M1-merge SHAP beeswarm saved → {out_path}")
+        except Exception as exc:
+            print(f"  [warn] M1-merge SHAP beeswarm failed: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -859,7 +1279,7 @@ def build_summary(pp_cols: list,
     rows = []
     for i, col in enumerate(pp_cols):
         row = {"feature": col}
-        for tag, vals in [("shap", shap_vals), ("ig", ig_vals), ("jac", jac_vals)]:
+        for tag, vals in [("shap", shap_vals), ("eg", ig_vals), ("jac", jac_vals)]:
             if vals is None:
                 continue
             ind = vals[:, i]          # indirect (first n_pp cols)
@@ -900,6 +1320,8 @@ def parse_args():
     p.add_argument("--n-ig-steps",   type=int,   default=50)
     p.add_argument("--shap-bg",      type=int,   default=100)
     p.add_argument("--ih-samples",   type=int,   default=20)
+    p.add_argument("--eg-bg",        type=int,   default=20,
+                   help="Random baselines for Expected Gradients (default: 20)")
     return p.parse_args()
 
 
@@ -927,6 +1349,9 @@ def main():
     print(f"\n  M1 dir : {m1_dir}")
     print(f"  M2 dir : {m2_dir}")
 
+    # ── M1 ↔ M2 coherence check (before any output is created) ───────────
+    _check_m1_m2_coherence(m1_dir, m2_dir)
+
     # ── Output directory ───────────────────────────────────────────────────
     out_dir = BASE_DIR / "outputs" / "Fusion" / f"{RUN_TS}_{MAT}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -936,20 +1361,36 @@ def main():
     # Step 1 — Load and preprocess data
     # ══════════════════════════════════════════════════════════════════════
     print("── Step 1: Loading data ────────────────────────────────────")
-    # M1-style preprocessing (IQR on pp + target)
-    df_m1, pp_cols, target_col = load_scalar_data(MAT, iqr_multiplier=1.5,
-                                                   filter_target=True)
+    # Load X-clean scalar data (X-outliers pre-removed by clean_data.py).
+    # y-filter is applied after the split is loaded (Step 2) using M1's
+    # data_processing.json so Fusion uses the exact same parts as M1.
+    df_scalar, pp_cols, target_col = load_scalar_data(MAT)
+    n_pp = len(pp_cols)
+
+    # Peek at M1 data_processing.json early to extract y_filter params
+    _dp_path = m1_dir / "data_processing.json"
+    _removed_y_ids: set = set()
+    if _dp_path.exists():
+        _dp_preview = json.loads(_dp_path.read_text())
+        if "y_filter" in _dp_preview:
+            _removed_y_ids = set(_dp_preview["y_filter"]["removed_ids"])
+            print(f"  y-filter (from M1 data_processing): "
+                  f"{len(_removed_y_ids)} parts to remove → {sorted(_removed_y_ids)}")
+
+    # M1-scope: same parts M1 used (clean CSV minus y-removed parts)
+    df_m1 = (df_scalar[~df_scalar.index.isin(_removed_y_ids)].copy()
+             if _removed_y_ids else df_scalar.copy())
     part_ids_m1 = df_m1.index.to_numpy()
     X_pp_m1     = df_m1[pp_cols].to_numpy(dtype=np.float32)
     y_m1        = df_m1[target_col].to_numpy(dtype=np.float32)
-    n_pp        = X_pp_m1.shape[1]
-    print(f"  M1-style dataset: {len(df_m1)} parts × {n_pp} pp features")
+    print(f"  M1-scope: {len(df_m1)} parts × {n_pp} pp features"
+          + (f"  ({len(df_scalar) - len(df_m1)} y-outliers removed)" if _removed_y_ids else ""))
 
-    # M2-style preprocessing (IQR on pp only, no target)
-    df_m2, _, _ = load_scalar_data(MAT, iqr_multiplier=1.5, filter_target=False)
+    # M2-scope: M2 never filtered on y — uses the full clean CSV
+    df_m2       = df_scalar.copy()
     part_ids_m2 = df_m2.index.to_numpy()
     X_pp_m2     = df_m2[pp_cols].to_numpy(dtype=np.float32)
-    print(f"  M2-style dataset: {len(df_m2)} parts × {n_pp} pp features")
+    print(f"  M2-scope: {len(df_m2)} parts × {n_pp} pp features")
 
     # M1's f-features (target for M2 scaler reconstruction)
     feat_csv = m1_dir / "pressure_features_f.csv"
@@ -962,9 +1403,7 @@ def main():
     # Step 2 — Load train/test split; map to indices
     # ══════════════════════════════════════════════════════════════════════
     print("\n── Step 2: Loading train/test split ────────────────────────")
-    split_data  = load_train_test_split(m1_dir)
-    dev_idx_m1, test_idx_m1 = map_split(split_data, part_ids_m1)
-    dev_idx_m2, test_idx_m2 = map_split(split_data, part_ids_m2)
+    dev_idx_m1, test_idx_m1, m1_pp_sc, m1_run_ts = load_m1_data_for_fusion(m1_dir, part_ids_m1)
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 3 — Load models
@@ -978,23 +1417,31 @@ def main():
     f_positions = get_f_positions(m1_dir, m2_f_cols)
 
     # ══════════════════════════════════════════════════════════════════════
-    # Step 4 — Reconstruct scalers
+    # Step 4 — Load or reconstruct scalers
     # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 4: Reconstructing scalers ─────────────────────────")
-    m1_pp_sc = reconstruct_m1_pp_scaler(X_pp_m1, dev_idx_m1, SEED, VAL_FR)
+    print("\n── Step 4: Loading scalers ─────────────────────────────────")
+    m2_y_sc = load_m2_y_sc_for_fusion(m2_dir)
 
-    # M2's y targets = f columns that M2 predicts (in M1's feature space)
-    # Join f features to M2's preprocessed dataset by part ID
-    df_f_m2 = df_m2.join(df_f_all[m2_f_cols], how="inner")
-    Y_f_m2  = df_f_m2[m2_f_cols].to_numpy(dtype=np.float32)
-    X_pp_m2_joined = df_f_m2[pp_cols].to_numpy(dtype=np.float32)
-    part_ids_m2_joined = df_f_m2.index.to_numpy()
+    if m1_pp_sc is not None and m2_y_sc is not None:
+        # Both saved — use directly; M2's x_sc equals M1's pp_sc
+        m2_x_sc = m1_pp_sc
+        print("  All scalers loaded from saved files (no reconstruction needed)")
+    else:
+        print("[warn] One or more scalers missing from files — reconstructing")
+        if m1_pp_sc is None:
+            m1_pp_sc = reconstruct_m1_pp_scaler(X_pp_m1, dev_idx_m1, SEED, VAL_FR)
 
-    # re-map M1 split to the joined M2 dataset (intersection)
-    dev_idx_m2j, _ = map_split(split_data, part_ids_m2_joined)
-
-    m2_x_sc, m2_y_sc = reconstruct_m2_scalers(
-        X_pp_m2_joined, Y_f_m2, dev_idx_m2j, SEED, VAL_FR)
+        # Need M2-joined dataset for y_sc reconstruction
+        split_data_fallback = load_train_test_split(m1_dir)
+        df_f_m2 = df_m2.join(df_f_all[m2_f_cols], how="inner")
+        Y_f_m2  = df_f_m2[m2_f_cols].to_numpy(dtype=np.float32)
+        X_pp_m2_joined     = df_f_m2[pp_cols].to_numpy(dtype=np.float32)
+        part_ids_m2_joined = df_f_m2.index.to_numpy()
+        dev_idx_m2j, _     = map_split(split_data_fallback, part_ids_m2_joined)
+        m2_x_sc_check, m2_y_sc = reconstruct_m2_scalers(
+            X_pp_m2_joined, Y_f_m2, dev_idx_m2j, SEED, VAL_FR)
+        _check_scalers_close(m1_pp_sc, m2_x_sc_check, "M1 pp_sc vs M2 reconstructed x_sc")
+        m2_x_sc = m1_pp_sc  # x_sc always equals M1's pp_sc
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 5 — Build FusionModel
@@ -1078,11 +1525,11 @@ def main():
                          args.shap_bg, device)
 
     # ══════════════════════════════════════════════════════════════════════
-    # Step 9 — Integrated Gradients
+    # Step 9 — Expected Gradients
     # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 9: Integrated Gradients ────────────────────────────")
-    ig_vals = run_ig(flat_fusion, X_test_flat, baseline_flat,
-                     args.n_ig_steps, device)
+    print("\n── Step 9: Expected Gradients ──────────────────────────────")
+    ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
+                     args.n_ig_steps, args.eg_bg, device)
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 10 — Integrated Hessians
@@ -1109,7 +1556,7 @@ def main():
             out_dir / "shap_values.csv", index=False)
     if ig_vals is not None:
         build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
-            out_dir / "ig_values.csv", index=False)
+            out_dir / "eg_values.csv", index=False)
     build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
         out_dir / "jacobian_values.csv", index=False)
 
@@ -1128,8 +1575,48 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     print("\n── Step 13: XAI plots ──────────────────────────────────────")
     save_xai_bars(summary, pp_cols, out_dir, MAT)
+    if shap_vals is not None:
+        save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
     save_total_effect_plot(summary, pp_cols, out_dir, MAT)
     save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # M1-merge XAI — f features (M2 output) + pp_direct → W
+    # Shows how much each encoder f_i feature and each raw pp feature
+    # individually contributes to the weight prediction via the merge head.
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
+    m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
+    m1_wrap.eval()
+
+    # Compute f_full from M2 predictions for dev and test sets
+    f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
+    f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
+
+    # Build [f_full | pp_raw] inputs for M1MergeWrapper
+    X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
+    X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
+    f_col_names      = [f"f_{i}" for i in range(n_f)]
+    m1merge_cols     = f_col_names + pp_cols
+    baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
+
+    print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
+          f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
+    print(f"  Active f positions   : {f_positions}  (others zero by construction)")
+
+    shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                    args.shap_bg, device)
+    ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                   args.n_ig_steps, args.eg_bg, device)
+
+    if shap_m1merge is not None:
+        build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
+            out_dir / "shap_m1merge_values.csv", index=False)
+    if ig_m1merge is not None:
+        build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
+            out_dir / "eg_m1merge_values.csv", index=False)
+    save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
+    print("  M1-merge XAI done.")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 14 — Copy model files; save fusion info
@@ -1155,6 +1642,7 @@ def main():
     info = {
         "material":     MAT,
         "run_ts":       RUN_TS,
+        "m1_run_ts":    m1_run_ts,
         "device":       str(device),
         "m1_dir":       str(m1_dir),
         "m2_dir":       str(m2_dir),
@@ -1171,6 +1659,7 @@ def main():
         "n_ig_steps":   args.n_ig_steps,
         "ih_samples":   args.ih_samples,
         "shap_bg":      args.shap_bg,
+        "eg_bg":        args.eg_bg,
         "m1_model_cfg": m1_cfg,
         "m2_model_cfg": m2_cfg,
         "m1_metrics":   {k: v for k, v in m1_meta.items()

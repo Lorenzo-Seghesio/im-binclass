@@ -62,6 +62,58 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ── Publication plot style ────────────────────────────────────────────────────
+_PLT_C: dict = {
+    "scatter":    "#2166AC",   # steel blue   — scatter dots / predictions
+    "ideal_line": "#B2182B",   # muted red    — 1:1 diagonal reference
+    "residual":   "#1B7837",   # forest green — residual scatter & histogram
+    "mean_line":  "#1B7837",   # forest green — mean residual vline
+    "zero_line":  "#555555",   # dark grey    — y = 0 reference
+    "fold":       "#4393C3",   # light blue   — per-fold CV bars
+    "fold_mean":  "#D6604D",   # coral        — mean CV bar
+    "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "ig":         "#7D54A4",   # purple       — IG / Expected Gradients bars
+    "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
+    "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
+    "total":      "#1B7837",   # green        — total combined attribution
+    "f_feat":     "#E69F00",   # gold         — M1-merge f encoder features
+    "pp_feat":    "#2166AC",   # blue         — M1-merge pp_direct features
+    "pressure":   "#2166AC",   # blue         — GradCAM pressure curve
+    "gradcam":    "#B2182B",   # red          — GradCAM activation overlay
+}
+
+
+def _strip_prefix(name: str) -> str:
+    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+        if name.startswith(pfx):
+            return name[len(pfx):]
+    return name
+
+
+def _strip_prefixes(names) -> list:
+    return [_strip_prefix(n) for n in names]
+
+
+plt.rcParams.update({
+    "font.family": "sans-serif", "font.size": 10,
+    "axes.labelsize": 11, "axes.titlesize": 12,
+    "axes.titleweight": "bold", "axes.titlepad": 10,
+    "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.8,
+    "axes.grid": True, "grid.color": "#E0E0E0", "grid.linestyle": "--",
+    "grid.linewidth": 0.5, "axes.axisbelow": True,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.size": 3.5, "ytick.major.size": 3.5,
+    "xtick.major.width": 0.7, "ytick.major.width": 0.7,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+    "savefig.facecolor": "white", "legend.framealpha": 0.92,
+    "legend.edgecolor": "#CCCCCC", "legend.frameon": True,
+    "lines.linewidth": 1.8, "patch.linewidth": 0.4,
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -74,6 +126,30 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def _scaler_to_dict(sc: MinMaxScaler) -> dict:
+    """Serialise a fitted MinMaxScaler to a JSON-safe dict."""
+    return {
+        "feature_range": list(sc.feature_range),
+        "data_min_":     sc.data_min_.tolist(),
+        "data_max_":     sc.data_max_.tolist(),
+        "scale_":        sc.scale_.tolist(),
+        "min_":          sc.min_.tolist(),
+    }
+
+
+def _dict_to_scaler(d: dict) -> MinMaxScaler:
+    """Reconstruct a MinMaxScaler from a saved dict."""
+    sc = MinMaxScaler(feature_range=tuple(d["feature_range"]))
+    sc.data_min_       = np.array(d["data_min_"],  dtype=np.float64)
+    sc.data_max_       = np.array(d["data_max_"],  dtype=np.float64)
+    sc.scale_          = np.array(d["scale_"],     dtype=np.float64)
+    sc.min_            = np.array(d["min_"],        dtype=np.float64)
+    sc.n_features_in_  = len(d["data_min_"])
+    sc.n_samples_seen_ = 0
+    return sc
+
 
 # ── Model definition ──────────────────────────────────────────────────────────
 
@@ -320,18 +396,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    # IQR outlier removal on input columns only
-    iqr_k = prep_cfg["iqr_multiplier"]
-    mask  = pd.Series(True, index=df.index)
-    for col in pp_cols:
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-        iqr    = q3 - q1
-        if iqr > 0:
-            mask &= (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
-    n_removed = int((~mask).sum())
-    df = df[mask].copy()
-    print(f"Outliers removed  : {n_removed}  →  {len(df)} parts remaining")
-
+    # X-outliers are pre-removed by clean_data.py; no IQR filtering needed here.
+    # M2 never filters on y (f-features), so no y-filter either.
     part_ids     = df.index.to_numpy()
     X            = df[pp_cols].to_numpy(dtype=np.float32)
     Y            = df[f_cols].to_numpy(dtype=np.float32)
@@ -346,21 +412,45 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     return part_ids, X, Y, pp_cols, f_cols, strat_labels
 
 
-def load_m1_train_test_split(splits_path: Path, part_ids: np.ndarray):
-    """Load M1 train_test_split.json and map part IDs → integer indices in M2's dataset.
+def load_m1_data_processing(m1_dir: Path, part_ids: np.ndarray):
+    """Load M1 data_processing.json; reconstruct scalers and map splits to M2 indices.
 
-    Parts absent from M2's cleaned dataset (e.g. additional outliers removed by M2)
-    are silently excluded from each partition.
-    Returns (dev_idx, test_idx) as np.intp arrays.
+    Falls back to train_test_split.json for backward compatibility (m1_pp_sc = None).
+    Returns (tr_idx, val_idx, test_idx, m1_pp_sc, m1_run_ts).
+    When falling back: tr_idx = dev_idx, val_idx = empty array, m1_pp_sc = None.
     """
-    data      = json.loads(splits_path.read_text())
     id_to_idx = {pid: i for i, pid in enumerate(part_ids.tolist())}
-    dev_idx  = np.array([id_to_idx[p] for p in data["train_part_ids"] if p in id_to_idx],
-                        dtype=np.intp)
-    test_idx = np.array([id_to_idx[p] for p in data["test_part_ids"]  if p in id_to_idx],
-                        dtype=np.intp)
-    print(f"M1 train/test split loaded  →  dev={len(dev_idx)}  test={len(test_idx)}")
-    return dev_idx, test_idx
+    dp_path = m1_dir / "data_processing.json"
+    if dp_path.exists():
+        dp = json.loads(dp_path.read_text())
+        tr_idx   = np.array([id_to_idx[p] for p in dp["train_part_ids"] if p in id_to_idx],
+                             dtype=np.intp)
+        val_idx  = np.array([id_to_idx[p] for p in dp["val_part_ids"]   if p in id_to_idx],
+                             dtype=np.intp)
+        test_idx = np.array([id_to_idx[p] for p in dp["test_part_ids"]  if p in id_to_idx],
+                             dtype=np.intp)
+        m1_pp_sc  = _dict_to_scaler(dp["pp_sc"])
+        m1_run_ts = dp.get("run_ts", "unknown")
+        print(f"M1 data_processing.json loaded  "
+              f"→  train={len(tr_idx)}  val={len(val_idx)}  test={len(test_idx)}")
+        print(f"  M1 run_ts: {m1_run_ts}  |  M1 pp_sc loaded (no reconstruction needed)")
+        return tr_idx, val_idx, test_idx, m1_pp_sc, m1_run_ts
+
+    # Fallback: train_test_split.json (no scaler info)
+    ts_path = m1_dir / "train_test_split.json"
+    if ts_path.exists():
+        print(f"[warn] data_processing.json not found in {m1_dir}; "
+              f"falling back to train_test_split.json (M1 pp_sc not available)")
+        data     = json.loads(ts_path.read_text())
+        dev_idx  = np.array([id_to_idx[p] for p in data["train_part_ids"] if p in id_to_idx],
+                             dtype=np.intp)
+        test_idx = np.array([id_to_idx[p] for p in data["test_part_ids"]  if p in id_to_idx],
+                             dtype=np.intp)
+        print(f"M1 train/test split loaded  →  dev={len(dev_idx)}  test={len(test_idx)}")
+        return dev_idx, np.array([], dtype=np.intp), test_idx, None, None
+
+    raise FileNotFoundError(
+        f"Neither data_processing.json nor train_test_split.json found in {m1_dir}")
 
 
 def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
@@ -475,23 +565,20 @@ def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
 
 def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str, plots_dir: Path):
     """Bar chart of K-fold CV metrics (indicative — dev data only)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
     fold_labels = [f"F{i + 1}" for i in range(K)] + ["Mean"]
-    bar_colors  = [C_BLUE] * K + [C_RED]
+    bar_colors  = [_PLT_C["fold"]] * K + [_PLT_C["fold_mean"]]
     for ax, metric in zip(axes, ["mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE"]):
         vals = list(metrics_df[metric]) + [metrics_df[metric].mean()]
-        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="k", linewidth=0.4)
-        ax.set_title(metric, fontsize=10)
+        bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="none", width=0.65)
+        ax.set_title(metric)
         ax.set_ylabel(metric)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.7)
-        ax.set_axisbelow(True)
+                    f"{v:.3f}", ha="center", va="bottom")
     fig.suptitle(f"[{material}] [Indicative] K-fold CV metrics (K={K})", fontsize=13)
     fig.tight_layout()
-    fig.savefig(plots_dir / "cv_metrics_folds.png", dpi=150)
+    fig.savefig(plots_dir / "cv_metrics_folds.png")
     plt.close(fig)
     print(f"CV plots saved → {plots_dir}")
 
@@ -500,38 +587,35 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
                           final_metrics: dict, plots_dir: Path,
                           material: str, f_cols: list):
     """Scatter + residual-hist plots evaluated on the held-out test set (PRIMARY)."""
-    C_BLUE, C_RED = "#0072B2", "#D55E00"
     n_f   = len(f_cols)
     ncols = min(n_f, 3)
     nrows = math.ceil(n_f / ncols)
 
-    # Scatter: real vs predicted per f-target
+    # Scatter: measured vs predicted per f-target
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(5 * ncols, 5 * nrows), squeeze=False)
     for i, fc in enumerate(f_cols):
         ax  = axes[i // ncols][i % ncols]
         y_r = Y_test[:, i]
         y_p = preds_test[:, i]
-        ax.scatter(y_r, y_p, alpha=0.7, edgecolors="k",
-                   linewidths=0.3, color=C_BLUE, zorder=3)
+        ax.scatter(y_r, y_p, color=_PLT_C["scatter"],
+                   s=45, alpha=0.8, edgecolors="white", linewidths=0.5, zorder=3)
         lo = min(y_r.min(), y_p.min())
         hi = max(y_r.max(), y_p.max())
-        ax.plot([lo, hi], [lo, hi], color=C_RED, linestyle="--",
-                linewidth=1.5, label="Ideal (1:1)")
-        ax.set_xlabel(f"Real {fc}", fontsize=10)
-        ax.set_ylabel(f"Pred {fc}", fontsize=10)
-        ax.set_title(fc, fontsize=10)
-        ax.legend(fontsize=8)
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-        ax.set_axisbelow(True)
+        ax.plot([lo, hi], [lo, hi], color=_PLT_C["ideal_line"], linestyle="--",
+                linewidth=1.5, label="Perfect prediction")
+        ax.set_xlabel(f"Measured {fc}")
+        ax.set_ylabel(f"Predicted {fc}")
+        ax.set_title(fc)
+        ax.legend()
     for i in range(n_f, nrows * ncols):
         axes[i // ncols][i % ncols].set_visible(False)
     fig.suptitle(
-        f"[{material}] Final Test — Real vs Predicted\n"
+        f"[{material}] Final Test — Measured vs Predicted\n"
         f"mean_MAE={final_metrics['mean_MAE']:.4f}",
         fontsize=12)
     fig.tight_layout()
-    fig.savefig(plots_dir / "scatter_final_test.png", dpi=150)
+    fig.savefig(plots_dir / "scatter_final_test.png")
     plt.close(fig)
 
     # Residuals histogram per f-target
@@ -540,21 +624,19 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
     for i, fc in enumerate(f_cols):
         ax  = axes[i // ncols][i % ncols]
         res = preds_test[:, i] - Y_test[:, i]
-        ax.hist(res, bins=20, color=C_BLUE, edgecolor="k", linewidth=0.4, alpha=0.85)
-        ax.axvline(0, color=C_RED, linestyle="--", linewidth=1.5)
-        ax.axvline(float(res.mean()), color="#009E73", linestyle="-",
+        ax.hist(res, bins=20, color=_PLT_C["residual"], edgecolor="white", alpha=0.85)
+        ax.axvline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
+        ax.axvline(float(res.mean()), color=_PLT_C["mean_line"], linestyle="-",
                    linewidth=1.5, label=f"Mean={res.mean():.4f}")
-        ax.set_xlabel("Residual (pred − real)", fontsize=10)
-        ax.set_ylabel("Count", fontsize=10)
-        ax.set_title(f"{fc}  std={res.std():.4f}", fontsize=10)
-        ax.legend(fontsize=8)
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-        ax.set_axisbelow(True)
+        ax.set_xlabel("Residual (pred − real)")
+        ax.set_ylabel("Count")
+        ax.set_title(f"{fc}  std={res.std():.4f}")
+        ax.legend()
     for i in range(n_f, nrows * ncols):
         axes[i // ncols][i % ncols].set_visible(False)
     fig.suptitle(f"[{material}] Residuals by f-target (final test)", fontsize=12)
     fig.tight_layout()
-    fig.savefig(plots_dir / "residuals_hist_final_test.png", dpi=150)
+    fig.savefig(plots_dir / "residuals_hist_final_test.png")
     plt.close(fig)
     print(f"Final test plots saved → {plots_dir}")
 
@@ -620,36 +702,35 @@ def save_predictions(model: M2Model, X: np.ndarray,
     return df_pred
 
 
-def final_train_m2(X, Y, dev_idx: np.ndarray, model_cfg: dict, train_cfg: dict,
-                   seed: int, device: torch.device, strat_labels=None):
-    """Train the final M2Model on all dev data.
-    A small internal validation split (val_fraction × dev) is used solely
-    for early stopping — it is never reported.  Final evaluation is always
-    performed by the caller on the held-out test set.
-    Uses final_epochs / final_patience from train_cfg when present.
-    Returns (model, x_sc, y_sc).
+def final_train_m2(X, Y, tr_idx: np.ndarray, val_idx: np.ndarray,
+                   x_sc: MinMaxScaler, model_cfg: dict, train_cfg: dict,
+                   seed: int, device: torch.device):
+    """Train the final M2Model using M1's exact train/val split boundaries.
+
+    x_sc is M1's pre-fitted pp_sc (passed in, not re-fitted here).
+    y_sc is fitted on Y[tr_idx] only.
+    If val_idx is empty (backward-compat fallback), an internal val split is created.
+    Returns (model, y_sc).
     """
     n_in  = X.shape[1]
     n_out = Y.shape[1]
-    if strat_labels is not None:
-        sss = StratifiedShuffleSplit(n_splits=1,
-                                     test_size=train_cfg["val_fraction"],
-                                     random_state=seed)
-        _tr, _val = next(sss.split(dev_idx, strat_labels[dev_idx]))
-        tr_idx  = dev_idx[_tr]
-        val_idx = dev_idx[_val]
-    else:
+
+    # Backward-compat: if val_idx is empty, carve it from tr_idx
+    if len(val_idx) == 0:
         rng     = np.random.default_rng(seed)
-        perm    = rng.permutation(len(dev_idx))
-        n_val   = max(1, int(len(dev_idx) * train_cfg["val_fraction"]))
-        val_idx = dev_idx[perm[:n_val]]
-        tr_idx  = dev_idx[perm[n_val:]]
+        perm    = rng.permutation(len(tr_idx))
+        n_val   = max(1, int(len(tr_idx) * train_cfg["val_fraction"]))
+        val_idx = tr_idx[perm[:n_val]]
+        tr_idx  = tr_idx[perm[n_val:]]
+        print(f"  [fallback] Internal val split created from tr_idx "
+              f"(train={len(tr_idx)}  val={len(val_idx)})")
 
     print(f"\n══ Final Training ═══════════════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  "
           f"(val split for early-stop only)")
 
-    x_sc, y_sc = fit_scalers(X[tr_idx], Y[tr_idx])
+    y_sc = MinMaxScaler()
+    y_sc.fit(Y[tr_idx])
     X_tr_s,  Y_tr_s  = apply_scalers(X[tr_idx],  Y[tr_idx],  x_sc, y_sc)
     X_val_s, Y_val_s = apply_scalers(X[val_idx], Y[val_idx], x_sc, y_sc)
 
@@ -664,7 +745,7 @@ def final_train_m2(X, Y, dev_idx: np.ndarray, model_cfg: dict, train_cfg: dict,
     model, best_val_mae = train_fold(model, X_tr_s, Y_tr_s, X_val_s, Y_val_s,
                                      final_tcfg, device)
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
-    return model, x_sc, y_sc
+    return model, y_sc
 
 
 # ── Optuna HPO ────────────────────────────────────────────────────────────────
@@ -889,17 +970,31 @@ def main():
     n_in, n_out = X.shape[1], Y.shape[1]
 
     # ── Initial train/test split ──────────────────────────────────────────────
-    # Prefer to reuse M1's exact split so both models see the same test set.
-    m1_splits_path = (BASE_DIR / data_cfg["features_csv"]).parent / "train_test_split.json"
-    if m1_splits_path.exists():
-        dev_idx, test_idx = load_m1_train_test_split(m1_splits_path, part_ids)
-    else:
-        print(f"[warn] M1 train_test_split.json not found at {m1_splits_path} — "
+    # Prefer to reuse M1's exact train/val/test split and pp_sc from data_processing.json.
+    m1_best_dir = (BASE_DIR / data_cfg["features_csv"]).parent
+    try:
+        tr_idx, val_idx, test_idx, m1_pp_sc, m1_run_ts = load_m1_data_processing(
+            m1_best_dir, part_ids)
+    except FileNotFoundError:
+        print(f"[warn] No M1 split files found in {m1_best_dir} — "
               f"generating a fresh independent split.")
         test_frac = prep_cfg.get("test_fraction", 0.2)
-        dev_idx, test_idx = _initial_split(len(part_ids), test_frac, seed, strat_labels)
+        dev_idx_gen, test_idx = _initial_split(len(part_ids), test_frac, seed, strat_labels)
+        tr_idx, val_idx, m1_pp_sc, m1_run_ts = dev_idx_gen, np.array([], dtype=np.intp), None, None
+
+    dev_idx   = np.concatenate([tr_idx, val_idx]) if len(val_idx) > 0 else tr_idx
     dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
-    print(f"Dev/test split  →  dev={len(dev_idx)}  test={len(test_idx)}")
+    print(f"Data split  →  train={len(tr_idx)}  val={len(val_idx)}  "
+          f"test={len(test_idx)}  dev={len(dev_idx)}")
+
+    # x_sc: use M1's pp_sc if available, otherwise fit on training data
+    if m1_pp_sc is not None:
+        x_sc = m1_pp_sc
+        print(f"  Using M1 pp_sc  (M1 run: {m1_run_ts})")
+    else:
+        x_sc = MinMaxScaler()
+        x_sc.fit(X[tr_idx])
+        print("  M1 pp_sc not available — fitting x_sc on training data")
 
     # ── Mode selection / HPO (dev data only) ─────────────────────────────────
     # mode = "optuna"  → Optuna HPO on dev data, then CV on dev, then final train
@@ -932,7 +1027,7 @@ def main():
         print("Using manual model config — skipping HPO.")
 
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
-    metrics_df, best_fold_idx, best_fold_mae = run_cv(
+    metrics_df, best_fold_idx, best_fold_mae, _, _, _, _ = run_cv(
         X[dev_idx], Y[dev_idx], model_cfg, train_cfg,
         f_cols, device, seed, dev_strat)
 
@@ -944,8 +1039,8 @@ def main():
     save_cv_plots(metrics_df, K, mat, run_best_dir)
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
-    final_model, x_sc, y_sc = final_train_m2(
-        X, Y, dev_idx, model_cfg, train_cfg, seed, device, dev_strat)
+    final_model, y_sc = final_train_m2(
+        X, Y, tr_idx, val_idx, x_sc, model_cfg, train_cfg, seed, device)
 
     X_te_s = x_sc.transform(X[test_idx]).astype(np.float32)
     final_metrics = evaluate_model(final_model, X_te_s, Y[test_idx], y_sc, f_cols, device)
@@ -966,6 +1061,25 @@ def main():
         run_best_dir, overall_best_dir,
         n_in, n_out, pp_cols, f_cols, model_cfg, data_cfg["id_col"])
 
+    # Save scalers.json — M2's y_sc for Fusion to load directly
+    sc_info = {
+        "m1_run_ts": m1_run_ts or "unknown",
+        "f_cols":    f_cols,
+        "y_sc":      _scaler_to_dict(y_sc),
+    }
+    (run_best_dir / "scalers.json").write_text(json.dumps(sc_info, indent=2))
+    print(f"Scalers saved → {run_best_dir / 'scalers.json'}")
+
+    # Save run_info.json — lightweight run identifier for users
+    m2_run_info = {
+        "run_ts":       _RUN_TS,
+        "material":     mat,
+        "m1_run_ts":    m1_run_ts or "unknown",
+        "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
+    }
+    (run_best_dir / "run_info.json").write_text(json.dumps(m2_run_info, indent=2))
+    print(f"Run info saved → {run_best_dir / 'run_info.json'}")
+
     df_pred = save_predictions(
         final_model, X, x_sc, y_sc, part_ids, f_cols,
         run_best_dir / "f_predictions.csv", data_cfg["id_col"], device)
@@ -976,6 +1090,8 @@ def main():
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
         metrics_df.to_csv(overall_best_dir / "cv_fold_metrics.csv")
         df_pred.to_csv(overall_best_dir / "f_predictions.csv")
+        shutil.copy2(run_best_dir / "scalers.json", overall_best_dir / "scalers.json")
+        (overall_best_dir / "run_info.json").write_text(json.dumps(m2_run_info, indent=2))
         if mode == "optuna" and best_hpo is not None:
             (overall_best_dir / "hpo_best_config.json").write_text(
                 json.dumps(best_hpo, indent=2))
