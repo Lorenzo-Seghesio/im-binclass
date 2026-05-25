@@ -59,6 +59,7 @@ _PLT_C: dict = {
     "fold":       "#4393C3",   # light blue   — per-fold CV bars
     "fold_mean":  "#D6604D",   # coral        — mean CV bar
     "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "shap_bar":   "#2166AC",   # steel blue   — SHAP summary bar plot
     "ig":         "#7D54A4",   # purple       — IG / Expected Gradients bars
     "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
     "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
@@ -67,11 +68,15 @@ _PLT_C: dict = {
     "pp_feat":    "#2166AC",   # blue         — M1-merge pp_direct features
     "pressure":   "#2166AC",   # blue         — GradCAM pressure curve
     "gradcam":    "#B2182B",   # red          — GradCAM activation overlay
+    "shap_cmap":    "cool",      # SHAP cmap — diverging blue-to-red (low=blue, high=red)
 }
 
 
 def _strip_prefix(name: str) -> str:
-    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+    for pfx in ("TCE_", "TCN_"):
+        if name.startswith(pfx):
+            return name[len(pfx):] + pfx[:-1]   # e.g. TCN_Foo → FooTCN
+    for pfx in ("DXP_", "QUA_", "SCA_", "MSS_", "IHR_", "SPE_"):
         if name.startswith(pfx):
             return name[len(pfx):]
     return name
@@ -574,15 +579,16 @@ def _xai_shap_gbdt(model, X_train: np.ndarray, X_test: np.ndarray,
         shap_vals = explainer.shap_values(X_test)          # (n_test, n_features)
 
         feat_names = _strip_prefixes(pp_cols)
-        shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
-                          plot_type="bar", show=False)
-        plt.savefig(out_dir / "xai_shap_bar.png")
-        plt.close()
+        with plt.rc_context(plt.rcParamsDefault):
+            shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
+                              plot_type="bar", show=False, color=_PLT_C["shap_bar"])
+            plt.savefig(out_dir / "xai_shap_bar.png", bbox_inches="tight", dpi=300)
+            plt.close()
 
-        shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
-                          plot_type="dot", show=False)
-        plt.savefig(out_dir / "xai_shap_beeswarm.png")
-        plt.close()
+            shap.summary_plot(shap_vals, X_test, feature_names=feat_names,
+                              plot_type="dot", show=False)
+            plt.savefig(out_dir / "xai_shap_beeswarm.png", bbox_inches="tight", dpi=300)
+            plt.close()
         print(f"  [XAI-{label}] SHAP saved → {out_dir}")
     except Exception as exc:
         print(f"  [XAI-{label}] SHAP failed: {exc}")
@@ -614,17 +620,26 @@ def _xai_shap_mlp(model: nn.Module, X_bg_sc: np.ndarray, X_test_sc: np.ndarray,
         explainer = shap.GradientExplainer(_Wrap2D(model), bg_t)
         raw       = explainer.shap_values(X_te_t)
         shap_np   = np.array(raw[0] if isinstance(raw, list) else raw)
+        if shap_np.ndim == 3 and shap_np.shape[-1] == 1:
+            shap_np = shap_np.squeeze(-1)    # (n, feat, 1) → (n, feat) for SHAP ≥0.46
 
         feat_names = _strip_prefixes(pp_cols)
-        shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
-                          plot_type="bar", show=False)
-        plt.savefig(out_dir / "xai_shap_bar.png")
-        plt.close()
+        mean_abs = np.abs(shap_np).mean(axis=0)
+        order = np.argsort(mean_abs)[::-1]
+        print(f"  [XAI-{label}] SHAP mean|val| per feature:")
+        for i in order:
+            print(f"    {feat_names[i]:40s}  {mean_abs[i]:.6f}")
 
-        shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
-                          plot_type="dot", show=False)
-        plt.savefig(out_dir / "xai_shap_beeswarm.png")
-        plt.close()
+        with plt.rc_context(plt.rcParamsDefault):
+            shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
+                              plot_type="bar", show=False, color=_PLT_C["shap_bar"])
+            plt.savefig(out_dir / "xai_shap_bar.png", bbox_inches="tight", dpi=300)
+            plt.close()
+
+            shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
+                              plot_type="dot", show=False)
+            plt.savefig(out_dir / "xai_shap_beeswarm.png", bbox_inches="tight", dpi=300)
+            plt.close()
         print(f"  [XAI-{label}] SHAP saved → {out_dir}")
     except Exception as exc:
         print(f"  [XAI-{label}] SHAP failed: {exc}")
@@ -1492,13 +1507,37 @@ def main():
     dev_idx, test_idx = _initial_split(len(y), test_frac, seed, strat_labels)
     print(f"\nDev/test split  →  dev={len(dev_idx)}  test={len(test_idx)}")
 
-    run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx)
-    run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx, pp_cols)
-    run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
-    run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+    # ── Active-model gates (default: all on) ──────────────────────────────────
+    active = cfg.get("active_models", {})
+    enc_on  = bool(active.get("encoder", 1))
+    mlp_on  = bool(active.get("mlp",     1))
+    lgbm_on = bool(active.get("lgbm",    1))
+    xgb_on  = bool(active.get("xgboost", 1))
+    print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}")
 
+    if enc_on:
+        run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx)
+    else:
+        print("\n[encoder]  skipped (active_models.encoder = 0)")
+
+    if mlp_on:
+        run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx, pp_cols)
+    else:
+        print("\n[mlp]      skipped (active_models.mlp = 0)")
+
+    if lgbm_on:
+        run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+    else:
+        print("\n[lgbm]     skipped (active_models.lgbm = 0)")
+
+    if xgb_on:
+        run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+    else:
+        print("\n[xgboost]  skipped (active_models.xgboost = 0)")
+
+    n_active = sum([enc_on, mlp_on, lgbm_on, xgb_on])
     print(f"\n{'═' * 60}")
-    print("All 4 reference models complete.")
+    print(f"{n_active}/4 reference model(s) complete.")
     print(f"Results saved under: {BASE_OUT / mat_dir}")
     print(f"{'═' * 60}")
 

@@ -91,6 +91,7 @@ _PLT_C: dict = {
     "fold":       "#4393C3",   # light blue   — per-fold CV bars
     "fold_mean":  "#D6604D",   # coral        — mean CV bar
     "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "shap_cmap":    "RdBu_r",    # SHAP cmap — diverging blue-to-red (low=blue, high=red)
     "ig":         "#7D54A4",   # purple       — Expected Gradients (EG) bars
     "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
     "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
@@ -103,7 +104,10 @@ _PLT_C: dict = {
 
 
 def _strip_prefix(name: str) -> str:
-    for pfx in ("DXP_", "QUA_", "TCE_", "TCN_", "SCA_", "MSS_", "IHR_", "SPE_"):
+    for pfx in ("TCE_", "TCN_"):
+        if name.startswith(pfx):
+            return name[len(pfx):] + pfx[:-1]   # e.g. TCN_Foo → FooTCN
+    for pfx in ("DXP_", "QUA_", "SCA_", "MSS_", "IHR_", "SPE_"):
         if name.startswith(pfx):
             return name[len(pfx):]
     return name
@@ -1092,14 +1096,18 @@ def _save_residuals_hist(y_true, y_pred, out_path: Path, material: str):
 
 def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
                           pp_cols: list, title: str, out_path: Path):
-    """Stacked horizontal bar: indirect (left) + direct (right)."""
-    labels = _strip_prefixes(pp_cols)
+    """Stacked horizontal bar: direct (left) + indirect (right), sorted by total."""
+    # Sort ascending so highest total appears at the top of the horizontal bar chart
+    order  = np.argsort(mean_abs_dir + mean_abs_ind)
+    labels = [_strip_prefixes(pp_cols)[i] for i in order]
+    mean_abs_dir = mean_abs_dir[order]
+    mean_abs_ind = mean_abs_ind[order]
     n  = len(pp_cols)
     y  = np.arange(n)
     fig, ax = plt.subplots(figsize=(9, max(4, n * 0.45)))
-    ax.barh(y, mean_abs_ind, label="Indirect (via M2)", color=_PLT_C["indirect"], alpha=0.85)
-    ax.barh(y, mean_abs_dir, left=mean_abs_ind, label="Direct (via PPMLP)",
-            color=_PLT_C["direct"], alpha=0.85)
+    ax.barh(y, mean_abs_dir, label="Direct (via PPMLP)", color=_PLT_C["direct"], alpha=0.85)
+    ax.barh(y, mean_abs_ind, left=mean_abs_dir, label="Indirect (via M2)",
+            color=_PLT_C["indirect"], alpha=0.85)
     ax.set_yticks(y)
     ax.set_yticklabels(labels)
     ax.set_xlabel("Mean |attribution|")
@@ -1114,9 +1122,9 @@ def save_xai_bars(summary_df: pd.DataFrame, pp_cols: list, out_dir: Path,
                   material: str):
     """One stacked bar plot per XAI method."""
     methods = {
-        "shap":     ("SHAP",                "shap_indirect_mean_abs", "shap_direct_mean_abs"),
-        "ig":       ("Integrated Gradients", "ig_indirect_mean_abs",   "ig_direct_mean_abs"),
-        "jacobian": ("Jacobian Pathway",     "jac_indirect_mean_abs",  "jac_direct_mean_abs"),
+        "shap":     ("SHAP",               "shap_indirect_mean_abs", "shap_direct_mean_abs"),
+        "eg":       ("Expected Gradients", "eg_indirect_mean_abs",   "eg_direct_mean_abs"),
+        "jacobian": ("Jacobian Pathway",   "jac_indirect_mean_abs",  "jac_direct_mean_abs"),
     }
     for tag, (label, col_ind, col_dir) in methods.items():
         if col_ind not in summary_df.columns:
@@ -1145,7 +1153,7 @@ def save_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
         shap_total = shap_vals[:, :n_pp] + shap_vals[:, n_pp:]  # (N, n_pp)
         shap_lib.summary_plot(shap_total, X_test,
                               feature_names=_strip_prefixes(pp_cols),
-                              plot_type="dot", show=False)
+                              plot_type="dot", show=False, cmap=_PLT_C["shap_cmap"])
         plt.title(f"[{material}] SHAP beeswarm — total effect (direct + indirect)")
         out_path = out_dir / "xai_shap_beeswarm.png"
         plt.savefig(out_path)
@@ -1165,16 +1173,19 @@ def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
     available = {k: v for k, v in method_cols.items() if v in summary_df.columns}
     if not available:
         return
+    # Sort features by average total across available methods, descending (highest on the left)
+    totals = np.mean([summary_df[col].values for col in available.values()], axis=0)
+    order  = np.argsort(totals)[::-1]
     n = len(pp_cols)
     x = np.arange(n)
     w = 0.8 / len(available)
     colours = [_PLT_C["shap"], _PLT_C["ig"]]
-    labels  = _strip_prefixes(pp_cols)
+    labels  = [_strip_prefixes(pp_cols)[i] for i in order]
 
     fig, ax = plt.subplots(figsize=(max(10, n * 0.7), max(4, n * 0.4)))
     for i, (label, col) in enumerate(available.items()):
         offset = (i - (len(available) - 1) / 2) * w
-        ax.bar(x + offset, summary_df[col].values, w, label=label,
+        ax.bar(x + offset, summary_df[col].values[order], w, label=label,
                color=colours[i % len(colours)], edgecolor="none")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right")
@@ -1256,7 +1267,7 @@ def save_xai_m1merge_bars(shap_m1: np.ndarray | None, ig_m1: np.ndarray | None,
             pp_feat_names = _strip_prefixes(m1merge_cols[n_f:])
             shap_lib.summary_plot(pp_shap, pp_shap,
                                   feature_names=pp_feat_names,
-                                  plot_type="dot", show=False)
+                                  plot_type="dot", show=False, cmap=_PLT_C["shap_cmap"])
             plt.title(f"[{material}] M1-merge SHAP beeswarm — pp_direct features")
             out_path = out_dir / "xai_m1merge_shap_beeswarm.png"
             plt.savefig(out_path)

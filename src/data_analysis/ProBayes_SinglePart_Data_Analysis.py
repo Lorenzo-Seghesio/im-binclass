@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 # ── Config ────────────────────────────────────────────────────────────────────
 PARQUET_PATH = "data/Fraunhofer_ProBayes_Dataset/dataset_V2.parquet"
 ID_COL       = "MET_MachineCycleID"
-PART_INDEX   = 100          # which part (row index) to plot; change as needed
+PART_INDEX   = 200          # which part (row index) to plot; change as needed
 COLS_PER_ROW = 3          # subplots per row inside each group figure
 MUX_CHANNELS = 19   # number of channels in multiplexed signals (should be 16 but also 19 not bad)
 # ─────────────────────────────────────────────────────────────────────────────
