@@ -90,9 +90,9 @@ _PLT_C: dict = {
     "zero_line":  "#555555",   # dark grey    — y = 0 reference
     "fold":       "#4393C3",   # light blue   — per-fold CV bars
     "fold_mean":  "#D6604D",   # coral        — mean CV bar
-    "shap":       "#D4691C",   # burnt orange — SHAP bars
+    "shap":       "#7434B0",   # burnt orange — SHAP bars
     "shap_cmap":    "RdBu_r",    # SHAP cmap — diverging blue-to-red (low=blue, high=red)
-    "ig":         "#7D54A4",   # purple       — Expected Gradients (EG) bars
+    "ig":         "#27913F",   # purple       — Expected Gradients (EG) bars
     "indirect":   "#D4691C",   # orange       — Fusion indirect path (via M2)
     "direct":     "#2166AC",   # blue         — Fusion direct path (via PPMLP)
     "total":      "#1B7837",   # green        — total combined attribution
@@ -1110,9 +1110,11 @@ def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
             color=_PLT_C["indirect"], alpha=0.85)
     ax.set_yticks(y)
     ax.set_yticklabels(labels)
-    ax.set_xlabel("Mean |attribution|")
+    ax.set_xlabel("Mean(|SHAP value|)")
     ax.set_title(title)
-    ax.legend()
+    # TODO: remove here manual config
+    ax.set_xlim(0, 3)
+    ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -1133,10 +1135,12 @@ def save_xai_bars(summary_df: pd.DataFrame, pp_cols: list, out_dir: Path,
             summary_df[col_ind].values,
             summary_df[col_dir].values,
             pp_cols,
-            f"[{material}] {label} — Direct vs Indirect feature influence",
-            out_dir / f"xai_bar_{tag}.png",
+            #TODO: rechange herw
+            f"{label} — Direct vs Indirect feature influence",
+            #f"[{material}] {label} — Direct vs Indirect feature influence",
+            out_dir / f"xai_bar_{tag}_pathway_split.png",
         )
-    print(f"  XAI bar plots saved → {out_dir}")
+    print(f"  XAI pathway-split bars saved → {out_dir}")
 
 
 def save_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
@@ -1151,9 +1155,12 @@ def save_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
     try:
         # Total attribution per feature per sample
         shap_total = shap_vals[:, :n_pp] + shap_vals[:, n_pp:]  # (N, n_pp)
-        shap_lib.summary_plot(shap_total, X_test,
-                              feature_names=_strip_prefixes(pp_cols),
-                              plot_type="dot", show=False, cmap=_PLT_C["shap_cmap"])
+        # Sort descending by mean(|direct+indirect|) — true net effect magnitude
+        order = np.argsort(np.abs(shap_total).mean(axis=0))[::-1]
+        feat_names_sorted = [_strip_prefixes(pp_cols)[i] for i in order]
+        shap_lib.summary_plot(shap_total[:, order], X_test[:, order],
+                              feature_names=feat_names_sorted,
+                              plot_type="dot", show=False, sort=False)
         plt.title(f"[{material}] SHAP beeswarm — total effect (direct + indirect)")
         out_path = out_dir / "xai_shap_beeswarm.png"
         plt.savefig(out_path)
@@ -1196,6 +1203,126 @@ def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
     fig.savefig(out_dir / "xai_total_effect.png")
     plt.close(fig)
     print(f"  Total-effect plot saved → {out_dir / 'xai_total_effect.png'}")
+
+
+def save_net_effect_bars(summary_df: pd.DataFrame, pp_cols: list,
+                         out_dir: Path, material: str):
+    """Horizontal bar of mean(|shap_direct + shap_indirect|) per feature.
+
+    Reflects the true net importance after within-sample pathway cancellation.
+    Compare to xai_bar_*_pathway_split which sums separately-averaged magnitudes.
+    One file per available method: xai_shap_net_effect.png, xai_eg_net_effect.png.
+    """
+    methods = {
+        "shap": ("SHAP", "shap_total_mean_abs", _PLT_C["shap"]),
+        "eg":   ("EG",   "eg_total_mean_abs",   _PLT_C["ig"]),
+    }
+    for tag, (label, col, color) in methods.items():
+        if col not in summary_df.columns:
+            continue
+        vals  = summary_df[col].values
+        order = np.argsort(vals)                  # ascending → highest at top
+        names = [_strip_prefixes(pp_cols)[i] for i in order]
+        n     = len(pp_cols)
+        fig, ax = plt.subplots(figsize=(8, max(4, n * 0.45)))
+        ax.barh(names, vals[order], color=color, alpha=0.85, edgecolor="none")
+        ax.set_xlabel("Mean(|SHAP_direct + SHAP_indirect|)")
+        #ax.set_title(f"[{material}] {label} — Net feature effect\n"
+        #             "mean(|SHAP_direct + SHAP_indirect|)\n"
+        ax.set_title(f"{label} — Resultant feature effect (direct + indirect)")
+        # TODO: here remove manula config
+        ax.set_xlim(0, 3)
+        fig.tight_layout()
+        out_path = out_dir / f"xai_{tag}_net_effect.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"  Net effect bar ({label}) saved → {out_path}")
+
+
+def save_pathway_agreement_scatter(summary_df: pd.DataFrame, pp_cols: list,
+                                   out_dir: Path, material: str):
+    """2D scatter: x = mean(shap_direct), y = mean(shap_indirect) per feature.
+
+    Quadrants reveal which features have agreeing pathways (same sign, near
+    the diagonal) vs opposing pathways (different signs, off-diagonal).
+    One file per method: xai_shap_pathway_agreement.png, xai_eg_pathway_agreement.png.
+    """
+    methods = {
+        "shap": ("SHAP", "shap_direct_mean", "shap_indirect_mean"),
+        "eg":   ("EG",   "eg_direct_mean",   "eg_indirect_mean"),
+    }
+    for tag, (label, col_dir, col_ind) in methods.items():
+        if col_dir not in summary_df.columns:
+            continue
+        x     = summary_df[col_dir].values
+        y     = summary_df[col_ind].values
+        names = _strip_prefixes(pp_cols)
+        lim   = max(np.abs(x).max(), np.abs(y).max()) * 1.25 or 1.0
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        ax.axhline(0, color="#aaaaaa", linewidth=0.8, zorder=1)
+        ax.axvline(0, color="#aaaaaa", linewidth=0.8, zorder=1)
+        ax.plot([-lim, lim], [-lim, lim], color="#cccccc", linewidth=1.0,
+                linestyle="--", zorder=1, label="Perfect agreement (dir = ind)")
+        ax.scatter(x, y, color=_PLT_C["scatter"], s=60, zorder=3)
+        for i, name in enumerate(names):
+            ax.annotate(name, (x[i], y[i]), fontsize=7,
+                        xytext=(4, 4), textcoords="offset points")
+        pad = lim * 0.93
+        ax.text( pad,  pad, "Both ↑",             ha="right", va="top",    fontsize=8, color="#555555")
+        ax.text(-pad,  pad, "Oppose\n(ind↑ dir↓)", ha="left",  va="top",    fontsize=8, color="#555555")
+        ax.text( pad, -pad, "Oppose\n(dir↑ ind↓)", ha="right", va="bottom", fontsize=8, color="#555555")
+        ax.text(-pad, -pad, "Both ↓",             ha="left",  va="bottom", fontsize=8, color="#555555")
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_xlabel("Mean direct attribution (via PPMLP)")
+        ax.set_ylabel("Mean indirect attribution (via M2)")
+        ax.set_title(f"[{material}] {label} — Pathway agreement per feature\n"
+                     "Near diagonal = agree  ·  Off-diagonal = pathways oppose")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        out_path = out_dir / f"xai_{tag}_pathway_agreement.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"  Pathway agreement scatter ({label}) saved → {out_path}")
+
+
+def save_cancellation_bars(summary_df: pd.DataFrame, pp_cols: list,
+                           out_dir: Path, material: str):
+    """Horizontal bar: pathway cancellation fraction per feature.
+
+    cancellation = 1 - mean(|direct+indirect|) / (mean(|direct|) + mean(|indirect|))
+
+    0 = pathways always push in the same direction.
+    1 = pathways perfectly cancel each other on every sample.
+    One file per method: xai_shap_cancellation.png, xai_eg_cancellation.png.
+    """
+    methods = {
+        "shap": ("SHAP", "shap_total_mean_abs", "shap_direct_mean_abs", "shap_indirect_mean_abs"),
+        "eg":   ("EG",   "eg_total_mean_abs",   "eg_direct_mean_abs",   "eg_indirect_mean_abs"),
+    }
+    for tag, (label, col_tot, col_dir, col_ind) in methods.items():
+        if col_tot not in summary_df.columns:
+            continue
+        net     = summary_df[col_tot].values
+        sum_abs = summary_df[col_dir].values + summary_df[col_ind].values
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cancel = np.where(sum_abs > 1e-12, 1.0 - net / sum_abs, 0.0)
+        cancel = np.clip(cancel, 0.0, 1.0)
+        order  = np.argsort(cancel)           # ascending → highest cancellation at top
+        names  = [_strip_prefixes(pp_cols)[i] for i in order]
+        n      = len(pp_cols)
+        fig, ax = plt.subplots(figsize=(8, max(4, n * 0.45)))
+        ax.barh(names, cancel[order], color=_PLT_C["total"], alpha=0.85, edgecolor="none")
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("Cancellation fraction")
+        ax.set_title(f"[{material}] {label} — Pathway cancellation per feature\n"
+                     "0 = pathways always agree  ·  1 = complete mutual cancellation")
+        fig.tight_layout()
+        out_path = out_dir / f"xai_{tag}_cancellation.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"  Cancellation bar ({label}) saved → {out_path}")
 
 
 def save_ih_heatmap(ih_matrix: np.ndarray, flat_cols: list, out_path: Path,
@@ -1267,7 +1394,7 @@ def save_xai_m1merge_bars(shap_m1: np.ndarray | None, ig_m1: np.ndarray | None,
             pp_feat_names = _strip_prefixes(m1merge_cols[n_f:])
             shap_lib.summary_plot(pp_shap, pp_shap,
                                   feature_names=pp_feat_names,
-                                  plot_type="dot", show=False, cmap=_PLT_C["shap_cmap"])
+                                  plot_type="dot", show=False)
             plt.title(f"[{material}] M1-merge SHAP beeswarm — pp_direct features")
             out_path = out_dir / "xai_m1merge_shap_beeswarm.png"
             plt.savefig(out_path)
@@ -1586,6 +1713,9 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     print("\n── Step 13: XAI plots ──────────────────────────────────────")
     save_xai_bars(summary, pp_cols, out_dir, MAT)
+    save_net_effect_bars(summary, pp_cols, out_dir, MAT)
+    save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
+    save_cancellation_bars(summary, pp_cols, out_dir, MAT)
     if shap_vals is not None:
         save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
     save_total_effect_plot(summary, pp_cols, out_dir, MAT)

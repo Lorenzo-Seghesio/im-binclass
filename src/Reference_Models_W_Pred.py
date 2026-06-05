@@ -633,6 +633,12 @@ def _xai_shap_mlp(model: nn.Module, X_bg_sc: np.ndarray, X_test_sc: np.ndarray,
         with plt.rc_context(plt.rcParamsDefault):
             shap.summary_plot(shap_np, X_test_sc, feature_names=feat_names,
                               plot_type="bar", show=False, color=_PLT_C["shap_bar"])
+            ax = plt.gca()
+            ax.set_xlabel("mean(|SHAP value|)")
+            # TODO: here remove manual ocnfig
+            ax.set_xlim(0, 3)
+            ax.xaxis.grid(True, color="#d0d0d0", linewidth=0.8, zorder=0)
+            ax.set_axisbelow(True)
             plt.savefig(out_dir / "xai_shap_bar.png", bbox_inches="tight", dpi=300)
             plt.close()
 
