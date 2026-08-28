@@ -11,13 +11,13 @@ Set the three macro variables below, then run:
 
 MODEL_DIR   : path (relative to project root) to the model directory.
               Examples:
-                "outputs/RefModels/MLP/PP/best_overall"
-                "outputs/RefModels/Encoder/PP/best_overall"
-                "outputs/M1/PP/best_overall"
-                "outputs/M2/PP/best_overall"
-                "outputs/Fusion/2026-05-25_10-49-58_PP"
-                "outputs/Reg/MLP/PP/models/best_model_overall"
-                "outputs/BC/MLP/PP/models/best_model_overall"
+                "outputs/ProBayes/RefModels/MLP/PP/best_overall"
+                "outputs/ProBayes/RefModels/Encoder/PP/best_overall"
+                "outputs/ProBayes/M1/PP/best_overall"
+                "outputs/ProBayes/M2/PP/best_overall"
+                "outputs/ProBayes/Fusion/2026-05-25_10-49-58_PP"
+                "outputs/ProBayes/Reg/MLP/PP/models/best_model_overall"
+                "outputs/ProBayes/BC/MLP/PP/models/best_model_overall"
 
 VIEW_TYPE   : "layered"  — colored box per layer type (great for MLPs)
               "graph"    — computation graph (requires Graphviz)
@@ -26,7 +26,7 @@ OUTPUT_NAME : filename for the saved image (PNG).
 """
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-MODEL_DIR   = "outputs/Fusion/2026-05-25_10-49-58_PP"
+MODEL_DIR   = "outputs/ProBayes/Fusion/2026-05-25_10-49-58_PP"
 VIEW_TYPE   = "graph"   # "layered" | "graph"
 OUTPUT_NAME = "model_architecture.png"
 # ─────────────────────────────────────────────────────────────────────────────

@@ -20,16 +20,17 @@ Usage
 
 Config files
 ------------
-  config/RefModels_PP_config.json
-  config/RefModels_ABS_config.json
-  config/RefModels_AllData_config.json
+  config/ProBayes/RefModels_PP_config.json
+  config/ProBayes/RefModels_ABS_config.json
+  config/ProBayes/RefModels_AllData_config.json
+  config/DoE1/RefModels_DoE1_config.json
 
 Outputs
 -------
-  outputs/RefModels/Encoder/[material]/run_best/   + best_overall/
-  outputs/RefModels/MLP/[material]/run_best/        + best_overall/
-  outputs/RefModels/LightGBM/[material]/run_best/   + best_overall/
-  outputs/RefModels/XGBoost/[material]/run_best/    + best_overall/
+  outputs/[dataset]/RefModels/Encoder/[material]/run_best/   + best_overall/
+  outputs/[dataset]/RefModels/MLP/[material]/run_best/        + best_overall/
+  outputs/[dataset]/RefModels/LightGBM/[material]/run_best/   + best_overall/
+  outputs/[dataset]/RefModels/XGBoost/[material]/run_best/    + best_overall/
 
   Each folder: best_model.pt|.joblib, best_metrics.json, fold_metrics.csv,
                scatter_best_fold.png, metrics_folds.png, residuals_hist_best_fold.png,
@@ -116,15 +117,17 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-BASE_OUT = BASE_DIR / "outputs" / "RefModels"
+BASE_OUT = BASE_DIR / "outputs" / "ProBayes" / "RefModels"
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 _CFG_MAP = {
-    "PP":  "RefModels_PP_config.json",
-    "ABS": "RefModels_ABS_config.json",
-    "ALL": "RefModels_AllData_config.json",
+    "PP":   "ProBayes/RefModels_PP_config.json",
+    "ABS":  "ProBayes/RefModels_ABS_config.json",
+    "ALL":  "ProBayes/RefModels_AllData_config.json",
+    "DOE1": "DoE1/RefModels_DoE1_config.json",
 }
-_MAT_DIR = {"PP": "PP", "ABS": "ABS", "ALL": "FullDataset"}
+
+_MAT_DIR = {"PP": "PP", "ABS": "ABS", "ALL": "FullDataset", "DOE1": "DOE1"}
 
 
 # ── NN model definitions ──────────────────────────────────────────────────────
@@ -253,8 +256,20 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     """Join scalar + pressure CSVs; clean; return (part_ids, X_pp, X_pt, y, strat_labels)."""
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
-    df_pressure = pd.read_csv(BASE_DIR / data_cfg["pressure_csv"],
-                               index_col=data_cfg["id_col"])
+    df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
+    pressure_sources = data_cfg.get("pressure_csvs")
+    if pressure_sources is None:
+        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+
+    pressure_frames = []
+    for i, src in enumerate(pressure_sources):
+        curve_name = src.get("name", f"curve_{i + 1}")
+        curve_path = src.get("path")
+        if curve_path is None:
+            raise ValueError("Each entry in data.pressure_csvs must define a 'path'.")
+        df_curve = pd.read_csv(BASE_DIR / curve_path, index_col=data_cfg["id_col"])
+        df_curve.columns = [f"{curve_name}__{c}" for c in df_curve.columns]
+        pressure_frames.append(df_curve)
 
     target_col = data_cfg["target_col"]
     mat_col    = data_cfg.get("material_col")
@@ -265,29 +280,35 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         print(f"Material encoding : {mat_map}")
         df_scalar[mat_col] = df_scalar[mat_col].map(mat_map)
 
-    df = df_scalar.join(df_pressure, how="inner")
+    df = df_scalar.copy()
+    for df_curve in pressure_frames:
+        df = df.join(df_curve, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
 
-    pressure_cols = list(df_pressure.columns)
+    pressure_cols = []
+    for df_curve in pressure_frames:
+        pressure_cols.extend(list(df_curve.columns))
     pp_cols       = [c for c in df_scalar.columns if c != target_col]
 
     for col in pp_cols:
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    # pp_cols are pre-cleaned by clean_data.py (X-outliers already removed).
-    # Apply IQR filter to target_col only (y-outlier removal on the dev dataset).
-    iqr_k  = prep_cfg["iqr_multiplier"]
-    col    = target_col
-    q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-    iqr    = q3 - q1
-    if iqr > 0:
-        y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+    remove_target_outliers = bool(prep_cfg.get("remove_target_outliers", True))
+    if remove_target_outliers:
+        iqr_k  = prep_cfg["iqr_multiplier"]
+        col    = target_col
+        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+        iqr    = q3 - q1
+        if iqr > 0:
+            y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+        else:
+            y_mask = pd.Series(True, index=df.index)
+        n_removed = int((~y_mask).sum())
+        df = df[y_mask].copy()
+        print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining")
     else:
-        y_mask = pd.Series(True, index=df.index)
-    n_removed = int((~y_mask).sum())
-    df = df[y_mask].copy()
-    print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining")
+        print("y-outlier removal disabled by config (preprocessing.remove_target_outliers=false)")
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
@@ -1484,10 +1505,11 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    global BASE_OUT
     parser = argparse.ArgumentParser(
         description="Reference weight-prediction models: Encoder, MLP, LightGBM, XGBoost.")
     parser.add_argument("--material", type=str.upper,
-                        choices=["PP", "ABS", "ALL"], required=True,
+                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help="Material subset: PP | ABS (plain KFold) or ALL (stratified). "
                              "Case-insensitive.")
     args = parser.parse_args()
@@ -1496,6 +1518,7 @@ def main():
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
     cfg      = json.loads(cfg_path.read_text())
     mat_dir  = _MAT_DIR[mat]
+    BASE_OUT = BASE_DIR / cfg.get("output_base_dir", "outputs/ProBayes/RefModels")
 
     prep_cfg = cfg["preprocessing"]
     seed     = prep_cfg["random_seed"]
@@ -1505,6 +1528,7 @@ def main():
     print(f"Device   : {device}")
     print(f"Material : {mat}  →  output subfolder: {mat_dir}")
     print(f"Config   : {cfg_path}")
+    print(f"Output   : {BASE_OUT}")
 
     _, X_pp, X_pt, y, strat_labels, pp_cols = load_data(cfg["data"], prep_cfg)
 

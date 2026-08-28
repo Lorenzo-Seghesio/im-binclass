@@ -37,7 +37,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from any subfolder)
 
 # Output root — overridden at runtime in __main__ based on dataset choice
-OUT_DIR = BASE_DIR / 'outputs/BC'
+OUT_DIR = BASE_DIR / 'outputs/ProBayes/BC'
 
 # Global variables
 best_auc_global = 0
@@ -587,9 +587,9 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
         plt.close()
         
         print(f"\nConfusion matrices saved:")
-        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_TPE.png")
-        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_RS.png")
-        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrices_combined.png")
+        print(f"  - outputs/ProBayes/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_TPE.png")
+        print(f"  - outputs/ProBayes/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_RS.png")
+        print(f"  - outputs/ProBayes/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrices_combined.png")
 
         # Plot ROC curves together
         plt.figure(figsize=(10, 6))
@@ -794,7 +794,7 @@ def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n
 # === Retrain Final Model ===
 def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=str(BASE_DIR / 'data/IM_Data_Train.csv'), csv_path_test=str(BASE_DIR / 'data/IM_Data_Test.csv'), hparam_cfg=None):
     hp = (hparam_cfg or {}).get('hyperparameters', {})
-    # hyperparameters: use trial value if optimized (present in params), else config/default
+    # hyperparameters: use trial value if optimized (present in params), else config/ProBayes/default
     lr_tp = params_tpe.get('lr', 1e-3) if isinstance(hp.get('lr'), list) else hp.get('lr', 1e-3)
     alpha_tp = params_tpe.get('alpha', 0.25) if isinstance(hp.get('alpha'), list) else hp.get('alpha', 0.25)
     gamma_tp = params_tpe.get('gamma', 2.0) if isinstance(hp.get('gamma'), list) else hp.get('gamma', 2.0)
@@ -1137,8 +1137,8 @@ def run_optimization(sampler, pruner, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_P
 if __name__ == "__main__":
     # Load config
     parser = argparse.ArgumentParser(description="Train a binary classification model.")
-    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/BC_MLP_config.json'),
-                        help="Path to the JSON config file (default: config/BC_MLP_config.json)")
+    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/ProBayes/BC_MLP_config.json'),
+                        help="Path to the JSON config file (default: config/ProBayes/BC_MLP_config.json)")
     parser.add_argument('--dataset', type=str,
                         choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2',
                                  'pp_1', 'pp_2', 'abs_1', 'abs_2'],
@@ -1168,7 +1168,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown dataset '{dataset}'. Choose PP, ABS, PP_1, PP_2, ABS_1, or ABS_2.")
 
-    OUT_DIR = BASE_DIR / f'outputs/BC/MLP/{dataset}'
+    OUT_DIR = BASE_DIR / f'outputs/ProBayes/BC/MLP/{dataset}'
     (OUT_DIR / 'models').mkdir(parents=True, exist_ok=True)
     (OUT_DIR / 'images').mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUT_DIR}")

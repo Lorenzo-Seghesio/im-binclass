@@ -17,10 +17,10 @@ Training
 
 Outputs
 -------
-  outputs/M1/FullDataset/plots/          scatter & metrics plots
-  outputs/M1/FullDataset/run_best/        best model of this run (always written)
-  outputs/M1/FullDataset/best_overall/    overall best model across all runs (updated when MAE improves)
-  outputs/M1/FullDataset/pressure_features_f.csv   encoder features for every part
+  outputs/ProBayes/M1/FullDataset/plots/          scatter & metrics plots
+  outputs/ProBayes/M1/FullDataset/run_best/        best model of this run (always written)
+  outputs/ProBayes/M1/FullDataset/best_overall/    overall best model across all runs (updated when MAE improves)
+  outputs/ProBayes/M1/FullDataset/pressure_features_f.csv   encoder features for every part
 """
 
 import copy, json, math, warnings

@@ -35,16 +35,16 @@ Arguments
 ---------
   --material       : PP | ABS  (single-material subset, case-insensitive)
   --m1-dir         : M1 best_overall directory
-                     (default: outputs/M1/{material}/best_overall)
+                     (default: outputs/[dataset]/M1/{material}/best_overall)
   --m2-dir         : M2 best_overall directory
-                     (default: outputs/M2/{material}/best_overall)
+                     (default: outputs/[dataset]/ProBayes/M2/{material}/best_overall)
   --seed           : random seed used to reconstruct scalers (default: 42)
   --val-fraction   : val fraction used by M1/M2 final_train (default: 0.1)
   --n-ig-steps     : integration steps for IG and IH (default: 50)
   --shap-bg        : max background samples for SHAP GradientExplainer (default: 100)
   --ih-samples     : max test samples used for Integrated Hessians (default: 20)
 
-Outputs (under outputs/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
+Outputs (under outputs/[dataset]/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
 ---------
   test_metrics.json              Fusion model metrics on held-out test set
   test_predictions.csv           ID_Part, y_true, y_pred
@@ -281,18 +281,38 @@ class MergeHead(nn.Module):
 class M1Model(nn.Module):
     def __init__(self, n_pp, mcfg):
         super().__init__()
-        self.encoder = PressureEncoder(
-            channels=mcfg["conv_channels"],
-            kernels=mcfg["conv_kernels"],
-            n_f=mcfg["n_f_features"],
-            pool_kernels=mcfg.get("enc_pool_kernels", []),
-        )
+        curve_cfgs = mcfg.get("curve_encoders", [])
+        if curve_cfgs:
+            self.encoders = nn.ModuleList([
+                PressureEncoder(
+                    channels=ccfg["conv_channels"],
+                    kernels=ccfg["conv_kernels"],
+                    n_f=ccfg["n_f_features"],
+                    pool_kernels=ccfg.get("enc_pool_kernels", []),
+                )
+                for ccfg in curve_cfgs
+            ])
+            n_f_total = int(sum(int(ccfg["n_f_features"]) for ccfg in curve_cfgs))
+        else:
+            self.encoders = nn.ModuleList([
+                PressureEncoder(
+                    channels=mcfg["conv_channels"],
+                    kernels=mcfg["conv_kernels"],
+                    n_f=mcfg["n_f_features"],
+                    pool_kernels=mcfg.get("enc_pool_kernels", []),
+                )
+            ])
+            n_f_total = int(mcfg["n_f_features"])
         self.pp_mlp  = PPMLP(n_pp, mcfg["pp_hidden"], mcfg["dropout"])
-        merge_in     = mcfg["n_f_features"] + mcfg["pp_hidden"][-1]
+        merge_in     = n_f_total + mcfg["pp_hidden"][-1]
         self.merge   = MergeHead(merge_in, mcfg["merge_hidden"], mcfg["dropout"])
 
     def forward(self, x_pt, x_pp):
-        f  = self.encoder(x_pt)
+        if isinstance(x_pt, (list, tuple)):
+            f_parts = [enc(x_pt[i]) for i, enc in enumerate(self.encoders)]
+        else:
+            f_parts = [self.encoders[0](x_pt)]
+        f  = torch.cat(f_parts, dim=1)
         pp = self.pp_mlp(x_pp)
         return self.merge(torch.cat([f, pp], dim=1))
 
@@ -483,27 +503,22 @@ def _compute_f_full(fusion: FusionModel, X_pp: np.ndarray,
 # Data loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_scalar_data(material: str):
-    """Load scalar_features_{material}_clean.csv; impute; return DataFrame.
+def load_scalar_data(material: str, cfg: dict):
+    """Load scalar CSV from config; impute; return DataFrame.
 
     X-outliers are pre-removed by clean_data.py.  y-outlier filtering is
     applied separately in main() using the y_filter section of M1's
     data_processing.json so that Fusion uses the exact same parts as M1.
     """
-    csv_path = (BASE_DIR / "data" / "Fraunhofer_ProBayes_Dataset"
-                / "extracted" / f"scalar_features_{material}_clean.csv")
-    if not csv_path.exists():
-        # Fallback to raw file with a warning (for backward compatibility)
-        csv_path = (BASE_DIR / "data" / "Fraunhofer_ProBayes_Dataset"
-                    / "extracted" / f"scalar_features_{material}.csv")
-        print(f"[warn] _clean.csv not found — falling back to raw CSV: {csv_path.name}")
-        print("       Run 'python src/Utility/clean_data.py --material "
-              f"{material}' first.")
+    data_cfg = cfg["data"]
+    csv_path = BASE_DIR / data_cfg["scalar_csv"]
     if not csv_path.exists():
         raise FileNotFoundError(f"Scalar CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path, index_col="ID_Part")
-    target_col = "SCA_PartWeight"
+    id_col = data_cfg["id_col"]
+    target_col = data_cfg["target_col"]
+    df = pd.read_csv(csv_path, index_col=id_col)
+    df = df.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
     pp_cols = [c for c in df.columns if c != target_col]
 
     # impute pp columns
@@ -698,7 +713,13 @@ def load_m1(m1_dir: Path, n_pp: int, device: torch.device):
     meta = json.loads(meta_path.read_text())
     mcfg = meta["model_cfg"]
     model = M1Model(n_pp, mcfg).to(device)
-    model.load_state_dict(torch.load(wt_path, map_location=device))
+    state = torch.load(wt_path, map_location=device)
+    if any(k.startswith("encoder.") for k in state.keys()):
+        state = {
+            (k.replace("encoder.", "encoders.0.", 1) if k.startswith("encoder.") else k): v
+            for k, v in state.items()
+        }
+    model.load_state_dict(state, strict=False)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -1445,14 +1466,15 @@ def build_per_sample_df(vals: np.ndarray, part_ids: np.ndarray,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fusion M1+M2 weight prediction + XAI")
-    p.add_argument("--material", required=True, choices=["PP", "ABS", "pp", "abs"],
-                   help="Material (PP or ABS)")
+    p.add_argument("--material", required=True,
+                   choices=["PP", "ABS", "DOE1", "pp", "abs", "doe1"],
+                   help="Material (PP, ABS, or DOE1)")
     p.add_argument("--m1-dir", default=None,
                    help="Path to M1 best_overall dir "
-                        "(default: outputs/M1/{material}/best_overall)")
+                        "(default: outputs/[dataset]/M1/{material}/best_overall)")
     p.add_argument("--m2-dir", default=None,
                    help="Path to M2 best_overall dir "
-                        "(default: outputs/M2/{material}/best_overall)")
+                        "(default: outputs/[dataset]/M2/{material}/best_overall)")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--n-ig-steps",   type=int,   default=50)
@@ -1474,11 +1496,23 @@ def main():
     print(f"  Fusion M1+M2  |  material={MAT}  |  device={device}")
     print(f"{'═'*60}")
 
+    cfg_map = {
+        "PP":   "config/ProBayes/Fusion_PP_config.json",
+        "ABS":  "config/ProBayes/Fusion_ABS_config.json",
+        "DOE1": "config/DoE1/Fusion_DoE1_config.json",
+    }
+    if MAT not in cfg_map:
+        sys.exit(f"[ERROR] Unsupported material '{MAT}'")
+    cfg_path = BASE_DIR / cfg_map[MAT]
+    if not cfg_path.exists():
+        sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
+    cfg = json.loads(cfg_path.read_text())
+
     # ── Resolve model directories ──────────────────────────────────────────
     m1_dir = Path(args.m1_dir) if args.m1_dir else \
-             BASE_DIR / "outputs" / "M1" / MAT / "best_overall"
+             BASE_DIR / cfg.get("models", {}).get("m1_best_dir", f"outputs/ProBayes/M1/{MAT}/best_overall")
     m2_dir = Path(args.m2_dir) if args.m2_dir else \
-             BASE_DIR / "outputs" / "M2" / MAT / "best_overall"
+             BASE_DIR / cfg.get("models", {}).get("m2_best_dir", f"outputs/ProBayes/M2/{MAT}/best_overall")
 
     for label, d in [("M1 dir", m1_dir), ("M2 dir", m2_dir)]:
         if not d.is_dir():
@@ -1491,7 +1525,8 @@ def main():
     _check_m1_m2_coherence(m1_dir, m2_dir)
 
     # ── Output directory ───────────────────────────────────────────────────
-    out_dir = BASE_DIR / "outputs" / "Fusion" / f"{RUN_TS}_{MAT}"
+    out_base = cfg.get("output", {}).get("output_base_dir", "outputs/ProBayes/Fusion")
+    out_dir = BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Output : {out_dir}\n")
 
@@ -1502,18 +1537,23 @@ def main():
     # Load X-clean scalar data (X-outliers pre-removed by clean_data.py).
     # y-filter is applied after the split is loaded (Step 2) using M1's
     # data_processing.json so Fusion uses the exact same parts as M1.
-    df_scalar, pp_cols, target_col = load_scalar_data(MAT)
+    df_scalar, pp_cols, target_col = load_scalar_data(MAT, cfg)
     n_pp = len(pp_cols)
 
     # Peek at M1 data_processing.json early to extract y_filter params
     _dp_path = m1_dir / "data_processing.json"
     _removed_y_ids: set = set()
+    _pp_cols_from_m1 = None
     if _dp_path.exists():
         _dp_preview = json.loads(_dp_path.read_text())
+        _pp_cols_from_m1 = _dp_preview.get("pp_cols")
         if "y_filter" in _dp_preview:
             _removed_y_ids = set(_dp_preview["y_filter"]["removed_ids"])
             print(f"  y-filter (from M1 data_processing): "
                   f"{len(_removed_y_ids)} parts to remove → {sorted(_removed_y_ids)}")
+    if _pp_cols_from_m1:
+        pp_cols = [c for c in _pp_cols_from_m1 if c in df_scalar.columns]
+        print(f"  Reusing pp_cols from M1 data_processing ({len(pp_cols)} features)")
 
     # M1-scope: same parts M1 used (clean CSV minus y-removed parts)
     df_m1 = (df_scalar[~df_scalar.index.isin(_removed_y_ids)].copy()

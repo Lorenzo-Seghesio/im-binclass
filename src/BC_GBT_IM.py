@@ -28,7 +28,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 
 # Output root — overridden at runtime in __main__ based on dataset choice
-OUT_DIR = BASE_DIR / 'outputs/BC_GBT'
+OUT_DIR = BASE_DIR / 'outputs/ProBayes/BC_GBT'
 
 # Globals for tracking best models across Optuna trials
 best_auc_global = 0.0
@@ -647,7 +647,7 @@ def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
 # === Main ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a GBT binary classification model.")
-    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/BC_GBT_config.json'))
+    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/ProBayes/BC_GBT_config.json'))
     parser.add_argument('--dataset', type=str,
                         choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2',
                                  'pp_1', 'pp_2', 'abs_1', 'abs_2'])
@@ -675,7 +675,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown dataset '{dataset}'. Choose PP, ABS, PP_1, PP_2, ABS_1, or ABS_2.")
 
-    OUT_DIR = BASE_DIR / f'outputs/BC/GBT/{dataset}'
+    OUT_DIR = BASE_DIR / f'outputs/ProBayes/BC/GBT/{dataset}'
     (OUT_DIR / 'models').mkdir(parents=True, exist_ok=True)
     (OUT_DIR / 'images').mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUT_DIR}")

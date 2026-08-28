@@ -33,14 +33,15 @@ Training
 
 Config files
 ------------
-  config/M2_PP_config.json        (for --material PP)
-  config/M2_ABS_config.json       (for --material ABS)
-  config/M2_AllData_config.json   (for --material ALL)
+  config/ProBayes/M2_PP_config.json        (for --material PP)
+  config/ProBayes/M2_ABS_config.json       (for --material ABS)
+  config/ProBayes/M2_AllData_config.json   (for --material ALL)
+  config/DoE1/M2_DoE1_config.json      (for --material DoE1)
 
 Outputs
 -------
-  outputs/M2/[material]/run_best/      best model of this run (always written)
-  outputs/M2/[material]/best_overall/  overall best across all runs (updated when mean MAE improves)
+  outputs/[dataset]/M2/[material]/run_best/      best model of this run (always written)
+  outputs/[dataset]/M2/[material]/best_overall/  overall best across all runs (updated when mean MAE improves)
   Each folder contains:
     best_model.pt         — model weights
     best_metrics.json     — metrics + architecture info
@@ -926,9 +927,10 @@ def best_cfg_from_study(study, optuna_cfg: dict,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 _CFG_MAP = {
-    "PP":  "M2_PP_config.json",
-    "ABS": "M2_ABS_config.json",
-    "ALL": "M2_AllData_config.json",
+    "PP":   "ProBayes/M2_PP_config.json",
+    "ABS":  "ProBayes/M2_ABS_config.json",
+    "ALL":  "ProBayes/M2_AllData_config.json",
+    "DOE1": "DoE1/M2_DoE1_config.json",
 }
 
 
@@ -936,7 +938,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="M2 MLP — multi-output regression: process params → M1 f features.")
     parser.add_argument("--material", type=str.upper,
-                        choices=["PP", "ABS", "ALL"], required=True,
+                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help=("Material subset: PP or ABS (plain KFold) "
                               "or ALL for full dataset (stratified KFold). "
                               "Case-insensitive."))

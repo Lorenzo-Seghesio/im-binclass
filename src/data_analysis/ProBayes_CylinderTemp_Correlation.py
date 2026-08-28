@@ -7,7 +7,7 @@ from scipy import stats
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).resolve().parent.parent.parent
 PARQUET_PATH = BASE_DIR / "data/Fraunhofer_ProBayes_Dataset/dataset_V2.parquet"
-OUTPUT_DIR   = BASE_DIR / "outputs/DataAnalysis"
+OUTPUT_DIR   = BASE_DIR / "outputs/ProBayes/DataAnalysis"
 
 REFERENCE = "QUA_CylinderTemperature11"
 TARGETS   = [

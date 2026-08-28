@@ -5,7 +5,7 @@ Sequential pipeline launcher for the weight-prediction models.
 
 Usage
 ─────
-    python Run_WPred_Pipeline.py                       # all materials: PP, ABS, ALL
+    python Run_WPred_Pipeline.py                       # all materials: PP, ABS, ALL, DOE1
     python Run_WPred_Pipeline.py --material PP
     python Run_WPred_Pipeline.py --material PP ABS
     python Run_WPred_Pipeline.py --material PP ABS ALL
@@ -33,7 +33,7 @@ from pathlib import Path
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).resolve().parent
 PIPELINE_CFG = BASE_DIR / "config" / "WPred_Pipeline_config.json"
-ALL_MATERIALS = ["PP", "ABS", "ALL"]
+ALL_MATERIALS = ["PP", "ABS", "ALL", "DOE1"]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -106,9 +106,10 @@ def main() -> None:
         choices=ALL_MATERIALS,
         default=None,
         metavar="MAT",
-        help="Material(s) to process: PP | ABS | ALL  (case-insensitive). "
+        help="Material(s) to process: PP | ABS | ALL | DOE1  (case-insensitive). "
+               "Includes DOE1 for the Arburg DoE dataset. "
              "Pass one or more values separated by spaces. "
-             "Omit entirely to run all three materials in sequence.")
+             "Omit entirely to run all materials in sequence.")
     parser.add_argument(
         "--config", type=Path, default=PIPELINE_CFG,
         help="Path to WPred_Pipeline_config.json "

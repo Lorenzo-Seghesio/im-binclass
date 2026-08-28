@@ -8,7 +8,7 @@ from scipy.signal import resample
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).resolve().parent.parent.parent
 CSV_PATH      = BASE_DIR / "data/Fraunhofer_ProBayes_Dataset/extracted/pressure_curve_padded.csv"
-OUTPUT_DIR    = BASE_DIR / "outputs/DataAnalysis"
+OUTPUT_DIR    = BASE_DIR / "outputs/ProBayes/DataAnalysis"
 SAMPLING_RATE = 200          # Hz  — acquisition frequency of the pressure sensor
 THRESHOLD_PCT  = 0.01         # 1 % of per-signal FFT peak; signals are considered
                               # "near zero" below this fraction → tune as needed

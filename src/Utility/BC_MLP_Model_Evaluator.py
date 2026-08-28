@@ -2,7 +2,7 @@
 #
 # Binary Classification using a Custom MLP Model
 # 
-# This script loads and evaluates the best overall model saved in outputs/BC/models/best_model_overall/
+# This script loads and evaluates the best overall model saved in outputs/ProBayes/ProBayes/BC/models/best_model_overall/
 # It reproduces the exact training and testing procedure to verify the results.
 
 import pandas as pd
@@ -28,7 +28,7 @@ from BC_MLP_IM import BinaryClassifier
 
 def load_best_model_metadata():
     """Load metadata from the best overall model."""
-    metadata_file = str(BASE_DIR / 'outputs/BC/models/best_model_overall/metadata.json')
+    metadata_file = str(BASE_DIR / 'outputs/ProBayes/BC/models/best_model_overall/metadata.json')
     
     if not os.path.exists(metadata_file):
         print(f"Error: No best model found at {metadata_file}")
@@ -43,7 +43,7 @@ def load_best_model_metadata():
 
 def load_data_and_model(metadata):
     """Load the saved training and test data, and the model."""
-    base_dir = str(BASE_DIR / 'outputs/BC/models/best_model_overall')
+    base_dir = str(BASE_DIR / 'outputs/ProBayes/BC/models/best_model_overall')
     
     # Load training data
     train_data = pd.read_csv(os.path.join(base_dir, 'train_data.csv'))
@@ -161,9 +161,9 @@ def plot_results(metadata, roc_auc, fpr, tpr, results, y_test, y_pred, threshold
     plt.title(f'ROC Curve - {model_name} Model (Reproduced)')
     plt.legend(loc='lower right')
     plt.grid(alpha=0.3)
-    plt.savefig(str(BASE_DIR / 'outputs/BC/images/roc_curve_reproduced.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(str(BASE_DIR / 'outputs/ProBayes/BC/images/roc_curve_reproduced.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\nROC curve saved to: outputs/BC/images/roc_curve_reproduced.png")
+    print(f"\nROC curve saved to: outputs/ProBayes/BC/images/roc_curve_reproduced.png")
     
     # Plot confusion matrix
     cm = confusion_matrix(y_test, y_pred)
@@ -177,9 +177,9 @@ def plot_results(metadata, roc_auc, fpr, tpr, results, y_test, y_pred, threshold
     disp.plot(cmap='Blues', values_format='d')
     plt.title(f'{model_name} Model - Confusion Matrix (Reproduced)\n(Threshold = {threshold:.2f}, AUC = {roc_auc:.4f})')
     plt.tight_layout()
-    plt.savefig(str(BASE_DIR / 'outputs/BC/models/best_model_overall/confusion_matrix_reproduced.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(str(BASE_DIR / 'outputs/ProBayes/BC/models/best_model_overall/confusion_matrix_reproduced.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Confusion matrix saved to: outputs/BC/models/best_model_overall/confusion_matrix_reproduced.png")
+    print(f"Confusion matrix saved to: outputs/ProBayes/BC/models/best_model_overall/confusion_matrix_reproduced.png")
     
     # Plot metrics across thresholds
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -205,9 +205,9 @@ def plot_results(metadata, roc_auc, fpr, tpr, results, y_test, y_pred, threshold
     ax2.grid(alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(str(BASE_DIR / 'outputs/BC/models/best_model_overall/metrics_vs_threshold_reproduced.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(str(BASE_DIR / 'outputs/ProBayes/BC/models/best_model_overall/metrics_vs_threshold_reproduced.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Metrics plot saved to: outputs/BC/models/best_model_overall/metrics_vs_threshold_reproduced.png")
+    print(f"Metrics plot saved to: outputs/ProBayes/BC/models/best_model_overall/metrics_vs_threshold_reproduced.png")
 
 
 def main():

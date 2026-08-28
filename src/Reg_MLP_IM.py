@@ -26,8 +26,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from any subfolder)
 
 # Output root — overridden at runtime in __main__ based on dataset choice
-# e.g. outputs/Reg/ABS, outputs/Reg/PP_1, etc.
-OUT_DIR = BASE_DIR / 'outputs/Reg'
+# e.g. outputs/ProBayes/Reg/ABS, outputs/ProBayes/Reg/PP_1, etc.
+OUT_DIR = BASE_DIR / 'outputs/ProBayes/Reg'
 
 # Colour palette (Tableau 10) — consistent across all plot types
 CAVITY_COLORS      = {'P1': '#4E79A7', 'P2': '#F28E2B'}   # steel blue / orange
@@ -850,7 +850,7 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
 def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=str(BASE_DIR / 'data/IM_Data_Train.csv'), csv_path_test=str(BASE_DIR / 'data/IM_Data_Test.csv'), hparam_cfg=None):
     hp = (hparam_cfg or {}).get('hyperparameters', {})
     opt_metric = (hparam_cfg or {}).get('opt_metric', 'mae')
-    # hyperparameters: use trial value if optimized (present in params), else config/default
+    # hyperparameters: use trial value if optimized (present in params), else config/ProBayes/default
     lr_tp = params_tpe.get('lr', 1e-3) if isinstance(hp.get('lr'), list) else hp.get('lr', 1e-3)
     dropout_tp = params_tpe.get('dropout', 0.2) if isinstance(hp.get('dropout'), list) else hp.get('dropout', 0.2)
     weight_decay_tp = params_tpe.get('weight_decay', 1e-4) if isinstance(hp.get('weight_decay'), list) else hp.get('weight_decay', 1e-4)
@@ -1260,8 +1260,8 @@ def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
 if __name__ == "__main__":
     # Load config
     parser = argparse.ArgumentParser(description="Train a regression model.")
-    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/Reg_MLP_config.json'),
-                        help="Path to the JSON config file (default: config/Reg_MLP_config.json)")
+    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/ProBayes/Reg_MLP_config.json'),
+                        help="Path to the JSON config file (default: config/ProBayes/Reg_MLP_config.json)")
     parser.add_argument('--dataset', type=str, choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2', 'pp_1', 'pp_2', 'abs_1', 'abs_2'],
                         help="Dataset to use: pp (both 1 and 2 cavities), abs (both 1 and 2 cavities), pp_1, pp_2, abs_1, abs_2. Overrides the value in the config file.")
     parser.add_argument('--opt_metric', type=str, choices=['mae', 'rmse', 'r2', 'mape', 'max_error'],
@@ -1312,7 +1312,7 @@ if __name__ == "__main__":
                          f"Choose 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', or 'ABS_2'.")
 
     # Set dataset-specific output directory and create subdirectories
-    OUT_DIR = BASE_DIR / f'outputs/Reg/MLP/{dataset}'
+    OUT_DIR = BASE_DIR / f'outputs/ProBayes/Reg/MLP/{dataset}'
     (OUT_DIR / 'models').mkdir(parents=True, exist_ok=True)
     (OUT_DIR / 'images').mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUT_DIR}")
@@ -1340,7 +1340,7 @@ if __name__ == "__main__":
     # plt.title('Mutual Information Scores for Features')
     # plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
     # plt.tight_layout()
-    # plt.savefig("outputs/Reg/images/mi_scores.png")
+    # plt.savefig("outputs/ProBayes/Reg/images/mi_scores.png")
     # plt.show()
     
     # # Run HPO otpimization with RS sampler and MedianPruner

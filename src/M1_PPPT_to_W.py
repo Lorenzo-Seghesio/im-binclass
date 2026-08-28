@@ -30,15 +30,17 @@ Training
 
 Config files
 ------------
-  config/M1_PP_config.json   (for --material PP)
-  config/M1_ABS_config.json  (for --material ABS)
+  config/ProBayes/M1_PP_config.json   (for --material PP)
+  config/ProBayes/M1_ABS_config.json  (for --material ABS)
+  config/ProBayes/M1_DoE1_config.json  (for --material DoE1)
+  config/DoE1/M1_AllData_config.json   (for --material ALL)
 
 Outputs
 -------
-  outputs/M1/[material]/plots/           scatter & metrics plots
-  outputs/M1/[material]/run_best/        best model of this run (always written)
-  outputs/M1/[material]/best_overall/    overall best model across all runs (updated when MAE improves)
-  outputs/M1/[material]/pressure_features_f.csv   encoder features for every part
+  outputs/[dataset]/M1/[material]/plots/           scatter & metrics plots
+  outputs/[dataset]/M1/[material]/run_best/        best model of this run (always written)
+  outputs/[dataset]/M1/[material]/best_overall/    overall best model across all runs (updated when MAE improves)
+  outputs/[dataset]/M1/[material]/pressure_features_f.csv   encoder features for every part
 """
 
 import argparse
@@ -241,33 +243,64 @@ class M1Model(nn.Module):
 
     def __init__(self, n_pp: int, mcfg: dict):
         super().__init__()
-        self.encoder = PressureEncoder(
-            channels=mcfg["conv_channels"],
-            kernels=mcfg["conv_kernels"],
-            n_f=mcfg["n_f_features"],
-            pool_kernels=mcfg.get("enc_pool_kernels", []),
-        )
+        curve_cfgs = mcfg.get("curve_encoders", [])
+        if curve_cfgs:
+            self.encoders = nn.ModuleList([
+                PressureEncoder(
+                    channels=ccfg["conv_channels"],
+                    kernels=ccfg["conv_kernels"],
+                    n_f=ccfg["n_f_features"],
+                    pool_kernels=ccfg.get("enc_pool_kernels", []),
+                )
+                for ccfg in curve_cfgs
+            ])
+            self.n_f_total = int(sum(int(ccfg["n_f_features"]) for ccfg in curve_cfgs))
+        else:
+            self.encoders = nn.ModuleList([
+                PressureEncoder(
+                    channels=mcfg["conv_channels"],
+                    kernels=mcfg["conv_kernels"],
+                    n_f=mcfg["n_f_features"],
+                    pool_kernels=mcfg.get("enc_pool_kernels", []),
+                )
+            ])
+            self.n_f_total = int(mcfg["n_f_features"])
+        self.n_curves = len(self.encoders)
         self.pp_mlp  = PPMLP(
             input_dim=n_pp,
             hidden_dims=mcfg["pp_hidden"],
             dropout=mcfg["dropout"],
         )
-        merge_in     = mcfg["n_f_features"] + mcfg["pp_hidden"][-1]
+        merge_in     = self.n_f_total + mcfg["pp_hidden"][-1]
         self.merge   = MergeHead(
             input_dim=merge_in,
             hidden_dims=mcfg["merge_hidden"],
             dropout=mcfg["dropout"],
         )
 
-    def forward(self, x_pt: torch.Tensor, x_pp: torch.Tensor) -> torch.Tensor:
-        f   = self.encoder(x_pt)
+    def _ensure_curve_list(self, x_pt):
+        if isinstance(x_pt, (list, tuple)):
+            return list(x_pt)
+        return [x_pt]
+
+    def forward(self, x_pt, x_pp: torch.Tensor) -> torch.Tensor:
+        x_curves = self._ensure_curve_list(x_pt)
+        if len(x_curves) != self.n_curves:
+            raise ValueError(
+                f"Expected {self.n_curves} pressure curve tensor(s), got {len(x_curves)}")
+        f_parts = [enc(x_curves[i]) for i, enc in enumerate(self.encoders)]
+        f   = torch.cat(f_parts, dim=1)
         pp  = self.pp_mlp(x_pp)
         return self.merge(torch.cat([f, pp], dim=1))
 
     @torch.no_grad()
-    def get_f(self, x_pt: torch.Tensor) -> torch.Tensor:
+    def get_f(self, x_pt) -> torch.Tensor:
         self.eval()
-        return self.encoder(x_pt)
+        x_curves = self._ensure_curve_list(x_pt)
+        if len(x_curves) != self.n_curves:
+            raise ValueError(
+                f"Expected {self.n_curves} pressure curve tensor(s), got {len(x_curves)}")
+        return torch.cat([enc(x_curves[i]) for i, enc in enumerate(self.encoders)], dim=1)
 
 
 def _count_params(model: nn.Module) -> int:
@@ -293,28 +326,39 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None):
 
 # ── Scaling utilities ─────────────────────────────────────────────────────────
 
-def fit_scalers(X_pp_tr: np.ndarray, X_pt_tr: np.ndarray):
+def fit_scalers(X_pp_tr: np.ndarray, X_pt_tr_list: list[np.ndarray]):
     """Fit MinMax scalers on training data only."""
     pp_sc = MinMaxScaler()
     pp_sc.fit(X_pp_tr)
-    pt_min = float(X_pt_tr.min())
-    pt_max = float(X_pt_tr.max())
-    return pp_sc, pt_min, pt_max
+    pt_scalers = []
+    for X_pt_tr in X_pt_tr_list:
+        pt_scalers.append({
+            "min": float(X_pt_tr.min()),
+            "max": float(X_pt_tr.max()),
+        })
+    return pp_sc, pt_scalers
 
 
-def apply_scalers(X_pp: np.ndarray, X_pt: np.ndarray,
-                  pp_sc: MinMaxScaler, pt_min: float, pt_max: float):
+def apply_scalers(X_pp: np.ndarray, X_pt_list: list[np.ndarray],
+                  pp_sc: MinMaxScaler, pt_scalers: list[dict]):
     """Apply pre-fitted scalers."""
     X_pp_s = pp_sc.transform(X_pp).astype(np.float32)
-    X_pt_s = ((X_pt - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
-    return X_pp_s, X_pt_s
+    X_pt_scaled = []
+    for X_pt, s in zip(X_pt_list, pt_scalers):
+        X_pt_scaled.append(
+            ((X_pt - s["min"]) / (s["max"] - s["min"] + 1e-8)).astype(np.float32)
+        )
+    return X_pp_s, X_pt_scaled
 
 
-def to_tensors(X_pp: np.ndarray, X_pt: np.ndarray,
+def to_tensors(X_pp: np.ndarray, X_pt_list: list[np.ndarray],
                y_arr: np.ndarray, device: torch.device):
     """Convert numpy arrays to PyTorch tensors on the target device."""
     t_pp = torch.tensor(X_pp,              dtype=torch.float32, device=device)
-    t_pt = torch.tensor(X_pt[:, None, :],  dtype=torch.float32, device=device)
+    t_pt = [
+        torch.tensor(X_pt[:, None, :], dtype=torch.float32, device=device)
+        for X_pt in X_pt_list
+    ]
     t_y  = torch.tensor(y_arr,             dtype=torch.float32, device=device)
     return t_pp, t_pt, t_y
 
@@ -322,8 +366,8 @@ def to_tensors(X_pp: np.ndarray, X_pt: np.ndarray,
 # ── Training & evaluation ─────────────────────────────────────────────────────
 
 def train_fold(model: M1Model,
-               Xpp_tr, Xpt_tr, y_tr,
-               Xpp_val, Xpt_val, y_val,
+               Xpp_tr, Xpt_tr_list, y_tr,
+               Xpp_val, Xpt_val_list, y_val,
                tcfg: dict, device: torch.device):
     """Train for one fold with early stopping; returns model & best val MAE."""
     criterion = nn.L1Loss()
@@ -335,10 +379,10 @@ def train_fold(model: M1Model,
                                                            patience=tcfg["scheduler_patience"],
                                                            factor=tcfg["scheduler_factor"])
 
-    pp_tr,  pt_tr,  ty_tr  = to_tensors(Xpp_tr,  Xpt_tr,  y_tr,  device)
-    pp_val, pt_val, ty_val = to_tensors(Xpp_val, Xpt_val, y_val, device)
+    pp_tr,  pt_tr_list,  ty_tr  = to_tensors(Xpp_tr,  Xpt_tr_list,  y_tr,  device)
+    pp_val, pt_val_list, ty_val = to_tensors(Xpp_val, Xpt_val_list, y_val, device)
 
-    loader = DataLoader(TensorDataset(pt_tr, pp_tr, ty_tr),
+    loader = DataLoader(TensorDataset(pp_tr, *pt_tr_list, ty_tr),
                         batch_size=tcfg["batch_size"], shuffle=True,
                         drop_last=False)
 
@@ -349,9 +393,12 @@ def train_fold(model: M1Model,
     for epoch in range(1, tcfg["epochs"] + 1):
         model.train()
         epoch_loss = 0.0
-        for b_pt, b_pp, b_y in loader:
+        for batch in loader:
+            b_pp = batch[0]
+            b_pt_list = list(batch[1:-1])
+            b_y  = batch[-1]
             optimizer.zero_grad()
-            loss = criterion(model(b_pt, b_pp), b_y)
+            loss = criterion(model(b_pt_list, b_pp), b_y)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(b_y)
@@ -359,7 +406,7 @@ def train_fold(model: M1Model,
 
         model.eval()
         with torch.no_grad():
-            val_mae = criterion(model(pt_val, pp_val), ty_val).item()
+            val_mae = criterion(model(pt_val_list, pp_val), ty_val).item()
         if tcfg["scheduler_factor"] < 1:
             scheduler.step(val_mae)
 
@@ -381,13 +428,13 @@ def train_fold(model: M1Model,
 
 
 def evaluate_model(model: M1Model,
-                   Xpp: np.ndarray, Xpt: np.ndarray,
+                   Xpp: np.ndarray, Xpt_list: list[np.ndarray],
                    y_arr: np.ndarray, device: torch.device) -> dict:
     """Return MAE / MSE / RMSE / R² and raw predictions."""
-    pp_t, pt_t, _ = to_tensors(Xpp, Xpt, y_arr, device)
+    pp_t, pt_t_list, _ = to_tensors(Xpp, Xpt_list, y_arr, device)
     model.eval()
     with torch.no_grad():
-        pred = model(pt_t, pp_t).cpu().numpy()
+        pred = model(pt_t_list, pp_t).cpu().numpy()
     mae  = float(mean_absolute_error(y_arr, pred))
     mse  = float(mean_squared_error(y_arr, pred))
     rmse = math.sqrt(mse)
@@ -402,16 +449,33 @@ def load_data(data_cfg: dict, prep_cfg: dict):
 
     Returns
     -------
-    part_ids, X_pp, X_pt, y, strat_labels
+    part_ids, X_pp, X_pt_list, y, strat_labels
         strat_labels is None for single-material configs;
         encoded integer material array when 'material_col' is present in data_cfg.
     """
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
-    df_pressure = pd.read_csv(BASE_DIR / data_cfg["pressure_csv"],
-                               index_col=data_cfg["id_col"])
-    df_scalar = df_scalar.drop(columns=data_cfg["drop_cols"], errors="ignore")
-    df        = df_scalar.join(df_pressure, how="inner")
+    pressure_sources = data_cfg.get("pressure_csvs")
+    if pressure_sources is None:
+        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+
+    pressure_frames = []
+    pressure_cols_by_curve = []
+    for i, src in enumerate(pressure_sources):
+        curve_name = src.get("name", f"curve_{i + 1}")
+        curve_path = src.get("path")
+        if curve_path is None:
+            raise ValueError("Each entry in data.pressure_csvs must define a 'path'.")
+        df_curve = pd.read_csv(BASE_DIR / curve_path, index_col=data_cfg["id_col"])
+        renamed_cols = [f"{curve_name}__{c}" for c in df_curve.columns]
+        df_curve.columns = renamed_cols
+        pressure_frames.append(df_curve)
+        pressure_cols_by_curve.append((curve_name, renamed_cols))
+
+    df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
+    df        = df_scalar.copy()
+    for df_curve in pressure_frames:
+        df = df.join(df_curve, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
 
     # Encode material column (full-dataset / ALL mode only)
@@ -423,41 +487,44 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         df[mat_col] = df[mat_col].map(mat_map)
 
     target_col    = data_cfg["target_col"]
-    pressure_cols = list(df_pressure.columns)
     pp_cols       = [c for c in df_scalar.columns if c != target_col]
 
     for col in pp_cols:
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    # pp_cols are pre-cleaned by clean_data.py (X-outliers already removed).
-    # Apply IQR filter to target_col only (y-outlier removal on the full dataset).
-    iqr_k  = prep_cfg["iqr_multiplier"]
-    col    = target_col
-    q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-    iqr    = q3 - q1
-    if iqr > 0:
-        y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+    remove_target_outliers = bool(prep_cfg.get("remove_target_outliers", True))
+    y_removed_ids = []
+    if remove_target_outliers:
+        iqr_k  = prep_cfg["iqr_multiplier"]
+        col    = target_col
+        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+        iqr    = q3 - q1
+        if iqr > 0:
+            y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
+        else:
+            y_mask = pd.Series(True, index=df.index)
+        y_removed_ids = df.index[~y_mask].tolist()
+        n_removed = int((~y_mask).sum())
+        df = df[y_mask].copy()
+        print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining"
+              + (f"  (IDs: {y_removed_ids})" if y_removed_ids else ""))
     else:
-        y_mask = pd.Series(True, index=df.index)
-    y_removed_ids = df.index[~y_mask].tolist()
-    n_removed = int((~y_mask).sum())
-    df = df[y_mask].copy()
-    print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining"
-          + (f"  (IDs: {y_removed_ids})" if y_removed_ids else ""))
+        print("y-outlier removal disabled by config (preprocessing.remove_target_outliers=false)")
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
-    X_pt         = df[pressure_cols].to_numpy(dtype=np.float32)
+    X_pt_list    = [df[cols].to_numpy(dtype=np.float32) for _, cols in pressure_cols_by_curve]
     y            = df[target_col].to_numpy(dtype=np.float32)
     strat_labels = df[mat_col].to_numpy() if mat_col else None
-    print(f"pp features : {X_pp.shape[1]}   |   time steps : {X_pt.shape[1]}   |   samples : {len(y)}")
+    curve_dims = ", ".join([f"{name}={arr.shape[1]}" for (name, _), arr in zip(pressure_cols_by_curve, X_pt_list)])
+    print(f"pp features : {X_pp.shape[1]}   |   curves : {len(X_pt_list)} ({curve_dims})   |   samples : {len(y)}")
     print(f"Target      : mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
-    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols, y_removed_ids
+    return part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols, y_removed_ids
 
 
-def run_cv(X_pp, X_pt, y, model_cfg: dict, train_cfg: dict,
+def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
            device: torch.device, seed: int, strat_labels=None):
     """Run K-fold CV on dev data (indicative); return metrics DataFrame.
 
@@ -501,10 +568,14 @@ def run_cv(X_pp, X_pt, y, model_cfg: dict, train_cfg: dict,
             tr_idx  = tv_idx[perm[n_val:]]
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
-        pp_sc, pt_min, pt_max = fit_scalers(X_pp[tr_idx], X_pt[tr_idx])
-        Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],   X_pt[tr_idx],   pp_sc, pt_min, pt_max)
-        Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx],  X_pt[val_idx],  pp_sc, pt_min, pt_max)
-        Xpp_te,  Xpt_te  = apply_scalers(X_pp[test_idx], X_pt[test_idx], pp_sc, pt_min, pt_max)
+        X_pt_tr_list = [x[tr_idx] for x in X_pt_list]
+        X_pt_val_list = [x[val_idx] for x in X_pt_list]
+        X_pt_te_list = [x[test_idx] for x in X_pt_list]
+
+        pp_sc, pt_scalers = fit_scalers(X_pp[tr_idx], X_pt_tr_list)
+        Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],   X_pt_tr_list,  pp_sc, pt_scalers)
+        Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx],  X_pt_val_list, pp_sc, pt_scalers)
+        Xpp_te,  Xpt_te  = apply_scalers(X_pp[test_idx], X_pt_te_list,  pp_sc, pt_scalers)
 
         torch.manual_seed(seed + fold)
         model = M1Model(n_pp, model_cfg).to(device)
@@ -607,7 +678,7 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
 
 
 def save_models(final_model: M1Model, final_metrics: dict,
-                n_pp: int, T: int, model_cfg: dict,
+                n_pp: int, T_list: list[int], model_cfg: dict,
                 run_best_dir: Path, overall_best_dir: Path) -> bool:
     """Save final model weights + test metrics; update overall_best if improved.
     best_metrics.json always contains the held-out test set metrics (primary).
@@ -619,7 +690,7 @@ def save_models(final_model: M1Model, final_metrics: dict,
         "MSE":      final_metrics["MSE"],
         "source":   "final_test",
         "n_pp":     n_pp,
-        "T":        T,
+        "T_list":   T_list,
         "model_cfg": model_cfg,
     }
     torch.save(final_model.state_dict(), run_best_dir / "best_model.pt")
@@ -647,10 +718,13 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
                      part_ids, feat_csv: Path, id_col: str,
                      device: torch.device):
     """Run best-fold encoder over the full cleaned dataset; save features CSV."""
-    pp_sc, pt_min, pt_max = best_scalers
-    _, X_pt_sc = apply_scalers(X_pp, X_pt, pp_sc, pt_min, pt_max)
-    pt_t       = torch.tensor(X_pt_sc[:, None, :], dtype=torch.float32, device=device)
-    f_features = best_model_cv.get_f(pt_t).cpu().numpy()
+    pp_sc, pt_scalers = best_scalers
+    _, X_pt_sc_list = apply_scalers(X_pp, X_pt, pp_sc, pt_scalers)
+    pt_t_list = [
+        torch.tensor(X_pt_sc[:, None, :], dtype=torch.float32, device=device)
+        for X_pt_sc in X_pt_sc_list
+    ]
+    f_features = best_model_cv.get_f(pt_t_list).cpu().numpy()
     f_cols     = [f"f_{i}" for i in range(f_features.shape[1])]
     df_f       = pd.DataFrame(f_features, columns=f_cols, index=part_ids)
     df_f.index.name = id_col
@@ -660,7 +734,7 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
     return df_f
 
 
-def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
+def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                    model_cfg: dict, train_cfg: dict,
                    seed: int, device: torch.device, strat_labels=None):
     """Train the final M1Model on all dev data.
@@ -668,7 +742,7 @@ def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
     for early stopping — it is never reported.  Final evaluation is always
     performed by the caller on the held-out test set.
     Uses final_epochs / final_patience from train_cfg when present.
-    Returns (model, (pp_sc, pt_min, pt_max)).
+    Returns (model, (pp_sc, pt_scalers)).
     """
     n_pp = X_pp.shape[1]
     if strat_labels is not None:
@@ -690,9 +764,11 @@ def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  "
           f"(val split for early-stop only)")
 
-    pp_sc, pt_min, pt_max = fit_scalers(X_pp[tr_idx], X_pt[tr_idx])
-    Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],  X_pt[tr_idx],  pp_sc, pt_min, pt_max)
-    Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx], X_pt[val_idx], pp_sc, pt_min, pt_max)
+    X_pt_tr_list = [x[tr_idx] for x in X_pt_list]
+    X_pt_val_list = [x[val_idx] for x in X_pt_list]
+    pp_sc, pt_scalers = fit_scalers(X_pp[tr_idx], X_pt_tr_list)
+    Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],  X_pt_tr_list,  pp_sc, pt_scalers)
+    Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx], X_pt_val_list, pp_sc, pt_scalers)
 
     final_tcfg = {
         **train_cfg,
@@ -706,7 +782,7 @@ def final_train_m1(X_pp, X_pt, y, dev_idx: np.ndarray,
         model, Xpp_tr, Xpt_tr, y[tr_idx],
         Xpp_val, Xpt_val, y[val_idx], final_tcfg, device)
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
-    return model, (pp_sc, pt_min, pt_max), tr_idx, val_idx
+    return model, (pp_sc, pt_scalers), tr_idx, val_idx
 
 
 # ── Optuna HPO ────────────────────────────────────────────────────────────────
@@ -793,7 +869,7 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int):
     return m_upd, t_upd
 
 
-def optuna_objective(trial, X_pp, X_pt, y,
+def optuna_objective(trial, X_pp, X_pt_list, y,
                      optuna_cfg, base_model_cfg, base_train_cfg,
                      seed, device, strat_labels=None):
     """Optuna objective: mini K-fold CV, returns mean test MAE (minimize)."""
@@ -835,10 +911,14 @@ def optuna_objective(trial, X_pp, X_pt, y,
             val_idx = tv_idx[perm[:n_val]]
             tr_idx  = tv_idx[perm[n_val:]]
 
-        pp_sc, pt_min, pt_max = fit_scalers(X_pp[tr_idx], X_pt[tr_idx])
-        Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],   X_pt[tr_idx],   pp_sc, pt_min, pt_max)
-        Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx],  X_pt[val_idx],  pp_sc, pt_min, pt_max)
-        Xpp_te,  Xpt_te  = apply_scalers(X_pp[test_idx], X_pt[test_idx], pp_sc, pt_min, pt_max)
+        X_pt_tr_list = [x[tr_idx] for x in X_pt_list]
+        X_pt_val_list = [x[val_idx] for x in X_pt_list]
+        X_pt_te_list = [x[test_idx] for x in X_pt_list]
+
+        pp_sc, pt_scalers = fit_scalers(X_pp[tr_idx], X_pt_tr_list)
+        Xpp_tr,  Xpt_tr  = apply_scalers(X_pp[tr_idx],   X_pt_tr_list,  pp_sc, pt_scalers)
+        Xpp_val, Xpt_val = apply_scalers(X_pp[val_idx],  X_pt_val_list, pp_sc, pt_scalers)
+        Xpp_te,  Xpt_te  = apply_scalers(X_pp[test_idx], X_pt_te_list,  pp_sc, pt_scalers)
 
         torch.manual_seed(seed + trial.number * 13 + fold)
         model = M1Model(n_pp, mcfg).to(device)
@@ -855,7 +935,7 @@ def optuna_objective(trial, X_pp, X_pt, y,
     return float(np.mean(mae_vals))
 
 
-def run_hpo(X_pp, X_pt, y, optuna_cfg, base_model_cfg, base_train_cfg,
+def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
             seed, device, strat_labels=None, out_dir=None):
     """Create Optuna study (TPE sampler + HyperbandPruner), run HPO, return study."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -890,7 +970,7 @@ def run_hpo(X_pp, X_pt, y, optuna_cfg, base_model_cfg, base_train_cfg,
 
     study.optimize(
         lambda t: optuna_objective(
-            t, X_pp, X_pt, y, optuna_cfg, base_model_cfg, base_train_cfg,
+            t, X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
             seed, device, strat_labels),
         n_trials=n_trials,
         show_progress_bar=True,
@@ -925,9 +1005,10 @@ def best_cfg_from_study(study, optuna_cfg: dict,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 _CFG_MAP = {
-    "PP":  "M1_PP_config.json",
-    "ABS": "M1_ABS_config.json",
-    "ALL": "M1_AllData_config.json",
+    "PP":  "ProBayes/M1_PP_config.json",
+    "ABS": "ProBayes/M1_ABS_config.json",
+    "ALL": "ProBayes/M1_AllData_config.json",
+    "DOE1": "DoE1/M1_DoE1_config.json",
 }
 
 
@@ -935,7 +1016,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="M1 dual-input NN — injection-moulded part weight prediction.")
     parser.add_argument("--material", type=str.upper,
-                        choices=["PP", "ABS", "ALL"], required=True,
+                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help=("Material subset: PP or ABS (plain KFold) "
                               "or ALL for full dataset (stratified KFold). "
                               "Case-insensitive."))
@@ -965,8 +1046,9 @@ def main():
     for d in [out_dir, run_best_dir, overall_best_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    part_ids, X_pp, X_pt, y, strat_labels, pp_cols, y_removed_ids = load_data(data_cfg, prep_cfg)
-    n_pp, T = X_pp.shape[1], X_pt.shape[1]
+    part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols, y_removed_ids = load_data(data_cfg, prep_cfg)
+    n_pp = X_pp.shape[1]
+    T_list = [arr.shape[1] for arr in X_pt_list]
 
     # ── Initial train/test split (done once; test data NEVER used in HPO or CV) ──
     test_frac = prep_cfg.get("test_fraction", 0.2)
@@ -983,7 +1065,7 @@ def main():
     if mode == "optuna":
         if "optuna" not in cfg:
             raise ValueError("mode='optuna' but no 'optuna' section found in config.")
-        study = run_hpo(X_pp[dev_idx], X_pt[dev_idx], y[dev_idx],
+        study = run_hpo(X_pp[dev_idx], [x[dev_idx] for x in X_pt_list], y[dev_idx],
                         cfg["optuna"], model_cfg, train_cfg,
                         seed, device, dev_strat, run_best_dir)
         model_cfg, train_cfg = best_cfg_from_study(
@@ -1005,7 +1087,7 @@ def main():
 
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
     metrics_df, best_fold_idx, best_fold_mae = run_cv(
-        X_pp[dev_idx], X_pt[dev_idx], y[dev_idx],
+        X_pp[dev_idx], [x[dev_idx] for x in X_pt_list], y[dev_idx],
         model_cfg, train_cfg, device, seed, dev_strat)
 
     K = train_cfg["k_folds"]
@@ -1016,9 +1098,9 @@ def main():
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
     final_model, final_scalers, tr_idx_final, val_idx_final = final_train_m1(
-        X_pp, X_pt, y, dev_idx, model_cfg, train_cfg, seed, device, dev_strat)
-    pp_sc, pt_min, pt_max = final_scalers
-    Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], X_pt[test_idx], pp_sc, pt_min, pt_max)
+        X_pp, X_pt_list, y, dev_idx, model_cfg, train_cfg, seed, device, dev_strat)
+    pp_sc, pt_scalers = final_scalers
+    Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], [x[test_idx] for x in X_pt_list], pp_sc, pt_scalers)
     final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[test_idx], device)
 
     print(f"\n{'═' * 60}")
@@ -1030,12 +1112,12 @@ def main():
     save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat)
 
-    overall_updated = save_models(final_model, final_metrics, n_pp, T, model_cfg,
+    overall_updated = save_models(final_model, final_metrics, n_pp, T_list, model_cfg,
                                   run_best_dir, overall_best_dir)
 
     # Extract f-features for the FULL cleaned dataset (all parts, incl. test)
     # so that M2 has features for every part when it evaluates its own test set.
-    df_f = extract_features(final_model, final_scalers, X_pp, X_pt,
+    df_f = extract_features(final_model, final_scalers, X_pp, X_pt_list,
                             part_ids, run_best_dir / "pressure_features_f.csv",
                             data_cfg["id_col"], device)
 
@@ -1058,11 +1140,13 @@ def main():
         "val_part_ids":   part_ids[val_idx_final].tolist(),
         "test_part_ids":  part_ids[test_idx].tolist(),
         "pp_sc":          _scaler_to_dict(pp_sc),
-        "pt_min":         float(pt_min),
-        "pt_max":         float(pt_max),
+        "pt_scalers":     pt_scalers,
+        "pt_min":         float(pt_scalers[0]["min"]),
+        "pt_max":         float(pt_scalers[0]["max"]),
         "y_filter": {
             "target_col":    data_cfg["target_col"],
             "iqr_multiplier": prep_cfg["iqr_multiplier"],
+            "enabled":       bool(prep_cfg.get("remove_target_outliers", True)),
             "removed_ids":   y_removed_ids,
         },
     }
