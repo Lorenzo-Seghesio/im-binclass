@@ -237,7 +237,7 @@ class MergeHead(nn.Module):
 class M1Model(nn.Module):
     """
     Full dual-input model.
-      forward(x_pt, x_pp) → predicted weight (B,)
+      forward(x_pt, x_pp)  → predicted weight (B,)
       get_f(x_pt)          → encoder features (B, n_f)   [no_grad]
     """
 
@@ -799,7 +799,8 @@ def _soi(trial, key: str, val) -> int:
         if isinstance(val, list) else int(val)
 
 
-def suggest_hyperparams(trial, ss: dict, n_pp: int):
+def suggest_hyperparams(trial, ss: dict, n_pp: int,
+                        base_model_cfg: dict | None = None):
     """Sample one trial's hyperparams from search_space.
     Returns (model_updates: dict, train_updates: dict).
     Rule: scalar in search_space → fixed; [min, max] → suggested by Optuna.
@@ -819,7 +820,60 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int):
         m_upd["dropout"] = _sof(trial, "dropout", ss["dropout"])
 
     # ── Conv encoder ──────────────────────────────────────────────────────────
-    if "enc_n_conv_layers" in ss:
+    # Multi-curve models use the same configurable ranges for every branch,
+    # but each branch gets its own Optuna parameter names and therefore its
+    # own independent samples.  PP/ABS/ALL retain the legacy single-encoder
+    # parameter names and behaviour.
+    has_curve_encoders = bool(base_model_cfg and base_model_cfg.get("curve_encoders"))
+    encoder_keys = {
+        "enc_n_conv_layers", "enc_channels", "enc_kernel_size",
+        "enc_pool_kernel_size", "n_f_features",
+    }
+    if has_curve_encoders and encoder_keys.intersection(ss):
+        curve_updates = []
+        for curve_idx, base_curve in enumerate(base_model_cfg["curve_encoders"]):
+            curve_cfg = copy.deepcopy(base_curve)
+            enc_prefix = f"enc_c{curve_idx}"
+            base_channels = curve_cfg.get("conv_channels", [1, 16])
+            base_kernels = curve_cfg.get("conv_kernels", [5])
+            base_pools = curve_cfg.get("enc_pool_kernels", [])
+
+            enc_n_key = f"{enc_prefix}_n_conv_layers"
+            enc_n = (_soi(trial, enc_n_key, ss["enc_n_conv_layers"])
+                     if "enc_n_conv_layers" in ss
+                     else len(base_channels) - 1)
+            conv_channels = [1]
+            conv_kernels = []
+            pool_kernels = []
+            for i in range(enc_n):
+                ch_key = f"{enc_prefix}_ch_{i}"
+                k_key = f"{enc_prefix}_k_{i}"
+                ch = (_soi(trial, ch_key, ss["enc_channels"])
+                      if "enc_channels" in ss
+                      else (base_channels[i + 1] if i + 1 < len(base_channels) else 16))
+                kernel = (_soi(trial, k_key, ss["enc_kernel_size"])
+                          if "enc_kernel_size" in ss
+                          else (base_kernels[i] if i < len(base_kernels) else 5))
+                conv_channels.append(ch)
+                conv_kernels.append(kernel)
+
+                if i < enc_n - 1:
+                    pool_key = f"{enc_prefix}_pk_{i}"
+                    pool = (_soi(trial, pool_key, ss["enc_pool_kernel_size"])
+                            if "enc_pool_kernel_size" in ss
+                            else (base_pools[i] if i < len(base_pools) else 1))
+                    pool_kernels.append(pool)
+
+            curve_cfg["conv_channels"] = conv_channels
+            curve_cfg["conv_kernels"] = conv_kernels
+            curve_cfg["enc_pool_kernels"] = pool_kernels
+            if "n_f_features" in ss:
+                curve_cfg["n_f_features"] = _soi(
+                    trial, f"{enc_prefix}_n_f_features", ss["n_f_features"])
+            curve_updates.append(curve_cfg)
+        m_upd["curve_encoders"] = curve_updates
+
+    elif "enc_n_conv_layers" in ss:
         enc_n  = _soi(trial, "enc_n_conv_layers", ss["enc_n_conv_layers"])
         ch_cfg = ss.get("enc_channels", 16)
         k_cfg  = ss.get("enc_kernel_size", 5)
@@ -843,7 +897,7 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int):
         m_upd["conv_kernels"]     = conv_kernels
         m_upd["enc_pool_kernels"] = pool_kernels
 
-    if "n_f_features" in ss:
+    if not has_curve_encoders and "n_f_features" in ss:
         m_upd["n_f_features"] = _soi(trial, "n_f_features", ss["n_f_features"])
 
     # ── PP MLP ────────────────────────────────────────────────────────────────
@@ -877,7 +931,7 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
     n_folds = optuna_cfg["n_folds"]
     n_pp    = X_pp.shape[1]
 
-    m_upd, t_upd = suggest_hyperparams(trial, ss, n_pp)
+    m_upd, t_upd = suggest_hyperparams(trial, ss, n_pp, base_model_cfg)
     mcfg = {**base_model_cfg, **m_upd}
     tcfg = {
         **base_train_cfg,
@@ -998,7 +1052,8 @@ def best_cfg_from_study(study, optuna_cfg: dict,
                         n_pp: int):
     """Reconstruct best (model_cfg, train_cfg) by replaying best trial params."""
     fixed_trial = optuna.trial.FixedTrial(study.best_trial.params)
-    m_upd, t_upd = suggest_hyperparams(fixed_trial, optuna_cfg["search_space"], n_pp)
+    m_upd, t_upd = suggest_hyperparams(
+        fixed_trial, optuna_cfg["search_space"], n_pp, base_model_cfg)
     return {**base_model_cfg, **m_upd}, {**base_train_cfg, **t_upd}
 
 

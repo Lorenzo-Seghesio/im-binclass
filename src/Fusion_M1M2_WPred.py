@@ -769,6 +769,38 @@ def get_f_positions(m1_dir: Path, m2_f_cols: list) -> list:
     return positions
 
 
+def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
+                        m1_dir: Path) -> int:
+    """Return M1's total flattened encoder-feature width.
+
+    Older single-curve M1 metadata stores this as ``n_f_features`` at the
+    top level. Multi-curve metadata stores one ``n_f_features`` value per
+    entry in ``curve_encoders`` instead, so the Fusion vector width is their
+    sum. The model is the final fallback because it has already been
+    reconstructed from the checkpoint metadata.
+    """
+    curve_cfgs = m1_cfg.get("curve_encoders")
+    if curve_cfgs:
+        n_f = sum(int(ccfg["n_f_features"]) for ccfg in curve_cfgs)
+    elif "n_f_features" in m1_cfg:
+        n_f = int(m1_cfg["n_f_features"])
+    elif hasattr(m1_model, "n_f_total"):
+        n_f = int(m1_model.n_f_total)
+    else:
+        # Last-resort compatibility for metadata from an older/custom run.
+        feat_csv = m1_dir / "pressure_features_f.csv"
+        if not feat_csv.exists():
+            raise KeyError(
+                "M1 metadata contains neither 'n_f_features' nor "
+                "'curve_encoders', and pressure_features_f.csv is missing"
+            )
+        n_f = len(pd.read_csv(feat_csv, index_col=0, nrows=1).columns)
+
+    if n_f <= 0:
+        raise ValueError(f"Invalid M1 encoder-feature width: {n_f}")
+    return int(n_f)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Evaluation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1133,8 +1165,8 @@ def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
     ax.set_yticklabels(labels)
     ax.set_xlabel("Mean(|SHAP value|)")
     ax.set_title(title)
-    # TODO: remove here manual config
-    ax.set_xlim(0, 3)
+    # TODO: remove I can add manual config
+    # ax.set_xlim(0, 3)
     ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(out_path)
@@ -1156,9 +1188,9 @@ def save_xai_bars(summary_df: pd.DataFrame, pp_cols: list, out_dir: Path,
             summary_df[col_ind].values,
             summary_df[col_dir].values,
             pp_cols,
-            #TODO: rechange herw
-            f"{label} — Direct vs Indirect feature influence",
-            #f"[{material}] {label} — Direct vs Indirect feature influence",
+            #TODO: if I want here I can change
+            # f"{label} — Direct vs Indirect feature influence",
+            f"[{material}] {label} — Direct vs Indirect feature influence",
             out_dir / f"xai_bar_{tag}_pathway_split.png",
         )
     print(f"  XAI pathway-split bars saved → {out_dir}")
@@ -1251,8 +1283,8 @@ def save_net_effect_bars(summary_df: pd.DataFrame, pp_cols: list,
         #ax.set_title(f"[{material}] {label} — Net feature effect\n"
         #             "mean(|SHAP_direct + SHAP_indirect|)\n"
         ax.set_title(f"{label} — Resultant feature effect (direct + indirect)")
-        # TODO: here remove manula config
-        ax.set_xlim(0, 3)
+        # TODO: here I cna add manual config
+        # ax.set_xlim(0, 3)
         fig.tight_layout()
         out_path = out_dir / f"xai_{tag}_net_effect.png"
         fig.savefig(out_path)
@@ -1591,7 +1623,7 @@ def main():
     m2_model, m2_cfg, m2_meta = load_m2(m2_dir, device)
 
     m2_f_cols   = m2_meta["f_cols"]        # e.g. ["f_3"]
-    n_f         = m1_cfg["n_f_features"]   # e.g. 5
+    n_f         = get_m1_n_f_features(m1_cfg, m1_model, m1_dir)
     f_positions = get_f_positions(m1_dir, m2_f_cols)
 
     # ══════════════════════════════════════════════════════════════════════

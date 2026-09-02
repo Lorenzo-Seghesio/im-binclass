@@ -117,7 +117,7 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-BASE_OUT = BASE_DIR / "outputs" / "ProBayes" / "RefModels"
+BASE_OUT = BASE_DIR / "outputs" # It will be in main
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 _CFG_MAP = {
