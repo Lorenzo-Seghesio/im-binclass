@@ -49,6 +49,18 @@ import xgboost as xgb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    from Utility.group_splitting import (
+        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_train_val_split, validate_group_disjoint,
+        validate_protected_excluded,
+    )
+except ModuleNotFoundError:  # package-style import from the repository root
+    from src.Utility.group_splitting import (
+        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_train_val_split, validate_group_disjoint,
+        validate_protected_excluded,
+    )
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -143,10 +155,14 @@ def _count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None):
+def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
+                   group_values=None, group_cfg=None):
     """One-time deterministic train/test split performed before HPO or CV.
     Returns (dev_idx, test_idx) as np.intp arrays.
     """
+    if grouping_enabled(group_cfg):
+        return grouped_train_test_split(n, test_frac, seed, group_values,
+                                        group_cfg, strat_labels)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=seed)
         dev_rel, test_rel = next(sss.split(np.zeros(n), strat_labels))
@@ -256,6 +272,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     """Join scalar + pressure CSVs; clean; return (part_ids, X_pp, X_pt, y, strat_labels)."""
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
+    group_col = data_cfg.get("group_col")
+    group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
     df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
     pressure_sources = data_cfg.get("pressure_csvs")
     if pressure_sources is None:
@@ -288,7 +306,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     pressure_cols = []
     for df_curve in pressure_frames:
         pressure_cols.extend(list(df_curve.columns))
-    pp_cols       = [c for c in df_scalar.columns if c != target_col]
+    pp_cols       = [c for c in df_scalar.columns
+                     if c != target_col and c != group_col]
 
     for col in pp_cols:
         if df[col].isna().any():
@@ -306,6 +325,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
             y_mask = pd.Series(True, index=df.index)
         n_removed = int((~y_mask).sum())
         df = df[y_mask].copy()
+        if group_values is not None:
+            group_values = group_values.loc[df.index]
         print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining")
     else:
         print("y-outlier removal disabled by config (preprocessing.remove_target_outliers=false)")
@@ -319,10 +340,16 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     print(f"pp features: {X_pp.shape[1]}  |  time steps: {X_pt.shape[1]}  |  samples: {len(y)}")
     print(f"Target: mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
-    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols
+    group_ids = (group_values.reindex(df.index).to_numpy()
+                 if group_values is not None else None)
+    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols, group_ids
 
 
-def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray) -> list:
+def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray,
+                group_values=None, group_cfg=None) -> list:
+    if grouping_enabled(group_cfg):
+        return grouped_kfold(np.arange(len(X)), K, seed, group_values,
+                             group_cfg, strat_labels)
     if strat_labels is not None:
         kf = StratifiedKFold(n_splits=K, shuffle=True, random_state=seed)
         return list(kf.split(X, strat_labels))
@@ -331,7 +358,11 @@ def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray) -> list:
 
 
 def _inner_split(tv_idx: np.ndarray, train_cfg: dict, seed: int, fold: int,
-                 strat_labels) -> tuple:
+                 strat_labels, group_values=None, group_cfg=None) -> tuple:
+    if grouping_enabled(group_cfg):
+        return grouped_train_val_split(
+            tv_idx, train_cfg["val_fraction"], seed + fold,
+            group_values, group_cfg, strat_labels)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
                                      test_size=train_cfg["val_fraction"],
@@ -808,10 +839,11 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
 # ── CV runners ────────────────────────────────────────────────────────────────
 
 def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
-                   dropout, train_cfg, device, seed, strat_labels=None):
+                   dropout, train_cfg, device, seed, strat_labels=None,
+                   group_values=None, group_cfg=None):
     """K-fold CV for Encoder on dev data only (indicative). Scales pressure curves per-fold."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pt)
+    splits = _split_iter(K, seed, strat_labels, X_pt, group_values, group_cfg)
 
     _dummy = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout)
     print(f"\n[Encoder] Parameters : {_count_params(_dummy):,}")
@@ -823,7 +855,8 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ Encoder CV Fold {fold + 1}/{K} ════════════════════════════════")
-        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels)
+        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
+                           group_values, group_cfg)
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
         pt_min = float(X_pt[tr_idx].min())
@@ -849,10 +882,10 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
 
 
 def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
-               device, seed, strat_labels=None):
+               device, seed, strat_labels=None, group_values=None, group_cfg=None):
     """K-fold CV for MLP on dev data only (indicative). Applies MinMaxScaler per-fold."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pp)
+    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg)
 
     _dummy = MLPModel(n_in, hidden_dims, dropout)
     print(f"\n[MLP] Parameters : {_count_params(_dummy):,}")
@@ -864,7 +897,8 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ MLP CV Fold {fold + 1}/{K} ══════════════════════════════════════")
-        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels)
+        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
+                           group_values, group_cfg)
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
         sc = MinMaxScaler().fit(X_pp[tr_idx])
@@ -890,10 +924,11 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
 
 
 def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
-                seed, strat_labels=None, label="GBDT"):
+                seed, strat_labels=None, label="GBDT", group_values=None,
+                group_cfg=None):
     """K-fold CV for GBDT on dev data only (indicative). Trains on full tv split."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pp)
+    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg)
 
     fold_results  = []
     best_fold_mae = float("inf")
@@ -901,7 +936,8 @@ def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ {label} CV Fold {fold + 1}/{K} ═══════════════════════════════════")
-        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels)
+        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
+                           group_values, group_cfg)
         train_idx = np.concatenate([tr_idx, val_idx])
         print(f"  Train={len(train_idx)}  Test={len(test_idx)}")
 
@@ -925,12 +961,18 @@ def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
 def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
                         channels, kernels, pool_kernels, head_hidden,
                         dropout, train_cfg: dict, device: torch.device,
-                        seed: int, strat_labels=None):
+                        seed: int, strat_labels=None, group_values=None,
+                        group_cfg=None, fixed_train_idx=None,
+                        fixed_val_idx=None):
     """Train the final Encoder on all dev data.
     Val split from dev used for early stopping only.
     Returns (model, (pt_min, pt_max)).
     """
-    tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels)
+    if fixed_train_idx is not None and fixed_val_idx is not None:
+        tr_idx, val_idx = fixed_train_idx, fixed_val_idx
+    else:
+        tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
+                                       group_values, group_cfg)
     print(f"\n══ Final Encoder Training ══════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
     pt_min = float(X_pt[tr_idx].min())
@@ -953,12 +995,17 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
 def final_train_mlp(X_pp, y, dev_idx: np.ndarray,
                     n_in: int, hidden_dims: list, dropout: float,
                     train_cfg: dict, device: torch.device,
-                    seed: int, strat_labels=None):
+                    seed: int, strat_labels=None, group_values=None,
+                    group_cfg=None, fixed_train_idx=None, fixed_val_idx=None):
     """Train the final MLP on all dev data.
     Val split from dev used for early stopping only.
     Returns (model, sc).
     """
-    tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels)
+    if fixed_train_idx is not None and fixed_val_idx is not None:
+        tr_idx, val_idx = fixed_train_idx, fixed_val_idx
+    else:
+        tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
+                                       group_values, group_cfg)
     print(f"\n══ Final MLP Training ══════════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
     sc = MinMaxScaler().fit(X_pp[tr_idx])
@@ -1088,7 +1135,8 @@ def suggest_xgb_params(trial, ss: dict) -> dict:
 
 # ── Optuna objectives ─────────────────────────────────────────────────────────
 
-def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels):
+def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
+                 group_values=None, group_cfg=None):
     ss = hpo_cfg["search_space"]
     mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
@@ -1101,10 +1149,12 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels)
     head_hidden  = mcfg_upd.get("head_hidden",   [64])
     dropout      = mcfg_upd.get("dropout",       base_tcfg.get("dropout", 0.2))
 
-    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pt)
+    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pt,
+                           group_values, group_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
-        tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels)
+        tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
+                           group_values, group_cfg)
         pt_min = float(X_pt[tr_idx].min())
         pt_max = float(X_pt[tr_idx].max())
         scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
@@ -1122,7 +1172,8 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels)
     return float(np.mean(mae_vals))
 
 
-def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels):
+def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
+             group_values=None, group_cfg=None):
     ss = hpo_cfg["search_space"]
     mcfg_upd, tcfg_upd = suggest_mlp_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
@@ -1133,10 +1184,12 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels):
     hidden_dims = mcfg_upd.get("hidden_dims", [64, 32])
     dropout     = mcfg_upd.get("dropout",     base_tcfg.get("dropout", 0.2))
 
-    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp)
+    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
+                           group_values, group_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
-        tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels)
+        tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
+                           group_values, group_cfg)
         sc = MinMaxScaler().fit(X_pp[tr_idx])
         X_tr_s  = sc.transform(X_pp[tr_idx]).astype(np.float32)
         X_val_s = sc.transform(X_pp[val_idx]).astype(np.float32)
@@ -1154,11 +1207,13 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels):
     return float(np.mean(mae_vals))
 
 
-def _obj_gbdt(trial, X_pp, y, hpo_cfg, model_class, suggest_fn, seed, strat_labels):
+def _obj_gbdt(trial, X_pp, y, hpo_cfg, model_class, suggest_fn, seed, strat_labels,
+              group_values=None, group_cfg=None):
     ss     = hpo_cfg["search_space"]
     params = suggest_fn(trial, ss)
 
-    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp)
+    splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
+                           group_values, group_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
         model = model_class(**params)
@@ -1207,7 +1262,9 @@ def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed
 # ── Orchestrators ─────────────────────────────────────────────────────────────
 
 def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
-                dev_idx: np.ndarray, test_idx: np.ndarray):
+                dev_idx: np.ndarray, test_idx: np.ndarray,
+                group_values=None, group_cfg=None, fixed_train_idx=None,
+                fixed_val_idx=None):
     hpo_cfg   = cfg["encoder_hpo"]
     train_cfg = cfg["training"].copy()
     rb_dir    = BASE_OUT / "Encoder" / mat_dir / "run_best" / _RUN_TS
@@ -1225,7 +1282,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         n_trials=hpo_cfg["n_trials"],
         n_startup_trials=hpo_cfg["n_startup_trials"],
         objective_fn=lambda t: _obj_encoder(t, X_pt[dev_idx], y[dev_idx], hpo_cfg,
-                                            train_cfg, seed, device, dev_strat),
+                                            train_cfg, seed, device, dev_strat,
+                                            group_values[dev_idx] if group_values is not None else None,
+                                            group_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="hyperband", n_folds=hpo_cfg["n_folds"])
 
@@ -1248,7 +1307,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds, {train_cfg['epochs']} epochs")
     metrics_df, best_fold_idx, best_fold_mae = run_cv_encoder(
         X_pt[dev_idx], y[dev_idx], channels, kernels, pool_kernels, head_hidden,
-        dropout, train_cfg, device, seed, dev_strat)
+        dropout, train_cfg, device, seed, dev_strat,
+        group_values[dev_idx] if group_values is not None else None, group_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
@@ -1259,7 +1319,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     # Final training on all dev; evaluate on held-out test
     final_model, (pt_min, pt_max) = final_train_encoder(
         X_pt, y, dev_idx, channels, kernels, pool_kernels, head_hidden,
-        dropout, train_cfg, device, seed, dev_strat)
+        dropout, train_cfg, device, seed, dev_strat, group_values, group_cfg,
+        fixed_train_idx, fixed_val_idx)
 
     scale = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
     res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[test_idx]), y[test_idx], device)
@@ -1287,7 +1348,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
 
 def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
-            dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
+            dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
+            group_values=None, group_cfg=None, fixed_train_idx=None,
+            fixed_val_idx=None):
     hpo_cfg   = cfg["mlp_hpo"]
     train_cfg = cfg["training"].copy()
     rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best" / _RUN_TS
@@ -1306,7 +1369,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         n_trials=hpo_cfg["n_trials"],
         n_startup_trials=hpo_cfg["n_startup_trials"],
         objective_fn=lambda t: _obj_mlp(t, X_pp[dev_idx], y[dev_idx], hpo_cfg,
-                                        train_cfg, seed, device, dev_strat),
+                                        train_cfg, seed, device, dev_strat,
+                                        group_values[dev_idx] if group_values is not None else None,
+                                        group_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="hyperband", n_folds=hpo_cfg["n_folds"])
 
@@ -1325,7 +1390,8 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds, {train_cfg['epochs']} epochs")
     metrics_df, best_fold_idx, best_fold_mae = run_cv_mlp(
         X_pp[dev_idx], y[dev_idx], n_in, hidden_dims, dropout,
-        train_cfg, device, seed, dev_strat)
+        train_cfg, device, seed, dev_strat,
+        group_values[dev_idx] if group_values is not None else None, group_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
@@ -1336,7 +1402,8 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     # Final training on all dev; evaluate on held-out test
     final_model, sc = final_train_mlp(
         X_pp, y, dev_idx, n_in, hidden_dims, dropout,
-        train_cfg, device, seed, dev_strat)
+        train_cfg, device, seed, dev_strat, group_values, group_cfg,
+        fixed_train_idx, fixed_val_idx)
 
     X_te_s = sc.transform(X_pp[test_idx]).astype(np.float32)
     res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[test_idx], device)
@@ -1365,7 +1432,8 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
 
 def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-             dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
+             dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
+             group_values=None, group_cfg=None):
     hpo_cfg   = cfg["lgbm_hpo"]
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best" / _RUN_TS
@@ -1384,7 +1452,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
         n_startup_trials=hpo_cfg["n_startup_trials"],
         objective_fn=lambda t: _obj_gbdt(t, X_pp[dev_idx], y[dev_idx], hpo_cfg,
                                          lgb.LGBMRegressor, suggest_lgbm_params,
-                                         seed, dev_strat),
+                                         seed, dev_strat,
+                                         group_values[dev_idx] if group_values is not None else None,
+                                         group_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="median", n_folds=hpo_cfg["n_folds"])
 
@@ -1399,7 +1469,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds")
     metrics_df, best_fold_idx, best_fold_mae = run_cv_gbdt(
         lgb.LGBMRegressor, best_params, X_pp[dev_idx], y[dev_idx],
-        train_cfg, seed, dev_strat, label="LightGBM")
+        train_cfg, seed, dev_strat, label="LightGBM",
+        group_values=group_values[dev_idx] if group_values is not None else None,
+        group_cfg=group_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
@@ -1434,7 +1506,8 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
 
 def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-                dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list):
+                dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
+                group_values=None, group_cfg=None):
     hpo_cfg   = cfg["xgboost_hpo"]
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best" / _RUN_TS
@@ -1453,7 +1526,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
         n_startup_trials=hpo_cfg["n_startup_trials"],
         objective_fn=lambda t: _obj_gbdt(t, X_pp[dev_idx], y[dev_idx], hpo_cfg,
                                          xgb.XGBRegressor, suggest_xgb_params,
-                                         seed, dev_strat),
+                                         seed, dev_strat,
+                                         group_values[dev_idx] if group_values is not None else None,
+                                         group_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="median", n_folds=hpo_cfg["n_folds"])
 
@@ -1468,7 +1543,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds")
     metrics_df, best_fold_idx, best_fold_mae = run_cv_gbdt(
         xgb.XGBRegressor, best_params, X_pp[dev_idx], y[dev_idx],
-        train_cfg, seed, dev_strat, label="XGBoost")
+        train_cfg, seed, dev_strat, label="XGBoost",
+        group_values=group_values[dev_idx] if group_values is not None else None,
+        group_cfg=group_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
@@ -1530,11 +1607,42 @@ def main():
     print(f"Config   : {cfg_path}")
     print(f"Output   : {BASE_OUT}")
 
-    _, X_pp, X_pt, y, strat_labels, pp_cols = load_data(cfg["data"], prep_cfg)
+    (part_ids, X_pp, X_pt, y, strat_labels,
+     pp_cols, group_ids) = load_data(cfg["data"], prep_cfg)
+    group_cfg = cfg["data"].get("group_split", {})
 
     # ── One-time initial split (dev / held-out test) ──────────────────────────
     test_frac = prep_cfg.get("test_fraction", 0.2)
-    dev_idx, test_idx = _initial_split(len(y), test_frac, seed, strat_labels)
+    # DoE1 reference models use the authoritative M1 split when available.
+    m1_dir_cfg = cfg.get("m1_split_dir") if mat == "DOE1" else None
+    dp_path = (BASE_DIR / m1_dir_cfg / "data_processing.json"
+               if m1_dir_cfg else None)
+    m1_train_idx = m1_val_idx = None
+    if dp_path is not None and dp_path.exists():
+        dp = json.loads(dp_path.read_text())
+        id_to_idx = {pid: i for i, pid in enumerate(part_ids.tolist())}
+        tr_idx = np.array([id_to_idx[p] for p in dp["train_part_ids"]
+                           if p in id_to_idx], dtype=np.intp)
+        val_idx = np.array([id_to_idx[p] for p in dp["val_part_ids"]
+                            if p in id_to_idx], dtype=np.intp)
+        test_idx = np.array([id_to_idx[p] for p in dp["test_part_ids"]
+                             if p in id_to_idx], dtype=np.intp)
+        dev_idx = np.concatenate([tr_idx, val_idx])
+        m1_train_idx, m1_val_idx = tr_idx, val_idx
+        print(f"M1 data_processing.json reused  →  train={len(tr_idx)}  "
+              f"val={len(val_idx)}  test={len(test_idx)}")
+    else:
+        dev_idx, test_idx = _initial_split(
+            len(y), test_frac, seed, strat_labels, group_ids, group_cfg)
+    if grouping_enabled(group_cfg) and group_ids is not None:
+        if m1_train_idx is not None:
+            validate_group_disjoint(m1_train_idx, m1_val_idx, test_idx,
+                                    group_values=group_ids, config=group_cfg)
+            validate_protected_excluded(test_idx, group_ids, group_cfg)
+        else:
+            validate_group_disjoint(dev_idx, test_idx,
+                                    group_values=group_ids, config=group_cfg)
+            validate_protected_excluded(test_idx, group_ids, group_cfg)
     print(f"\nDev/test split  →  dev={len(dev_idx)}  test={len(test_idx)}")
 
     # ── Active-model gates (default: all on) ──────────────────────────────────
@@ -1546,22 +1654,28 @@ def main():
     print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}")
 
     if enc_on:
-        run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx)
+        run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
+                 dev_idx, test_idx, group_ids, group_cfg,
+                 m1_train_idx, m1_val_idx)
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
 
     if mlp_on:
-        run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels, dev_idx, test_idx, pp_cols)
+        run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
+                dev_idx, test_idx, pp_cols, group_ids, group_cfg,
+                m1_train_idx, m1_val_idx)
     else:
         print("\n[mlp]      skipped (active_models.mlp = 0)")
 
     if lgbm_on:
-        run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+        run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
+                dev_idx, test_idx, pp_cols, group_ids, group_cfg)
     else:
         print("\n[lgbm]     skipped (active_models.lgbm = 0)")
 
     if xgb_on:
-        run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx, pp_cols)
+        run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
+                 dev_idx, test_idx, pp_cols, group_ids, group_cfg)
     else:
         print("\n[xgboost]  skipped (active_models.xgboost = 0)")
 

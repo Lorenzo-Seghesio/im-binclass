@@ -63,6 +63,18 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    from Utility.group_splitting import (
+        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_train_val_split, validate_group_disjoint,
+        validate_protected_excluded,
+    )
+except ModuleNotFoundError:  # package-style import from the repository root
+    from src.Utility.group_splitting import (
+        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_train_val_split, validate_group_disjoint,
+        validate_protected_excluded,
+    )
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -196,12 +208,16 @@ def _count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None):
+def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
+                   group_values=None, group_cfg=None):
     """One-time deterministic train/test split performed before HPO or CV.
     Returns (dev_idx, test_idx) as np.intp arrays.
     Uses StratifiedShuffleSplit when strat_labels is provided (ALL mode)
     so that material proportions are balanced in both splits.
     """
+    if grouping_enabled(group_cfg):
+        return grouped_train_test_split(n, test_frac, seed, group_values,
+                                        group_cfg, strat_labels)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_frac,
                                      random_state=seed)
@@ -365,6 +381,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     df_f      = pd.read_csv(BASE_DIR / data_cfg["features_csv"],
                             index_col=data_cfg["id_col"])
 
+    group_col = data_cfg.get("group_col")
+    group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
     df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
     df        = df_scalar.join(df_f, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
@@ -390,7 +408,7 @@ def load_data(data_cfg: dict, prep_cfg: dict):
             "All f columns are zero — run M1 first to generate valid pressure features.")
     print(f"Active f targets  : {f_cols}")
 
-    pp_cols = [c for c in df.columns if c not in f_cols]
+    pp_cols = [c for c in df.columns if c not in f_cols and c != group_col]
 
     # Impute missing values in input columns
     for col in pp_cols:
@@ -400,6 +418,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     # X-outliers are pre-removed by clean_data.py; no IQR filtering needed here.
     # M2 never filters on y (f-features), so no y-filter either.
     part_ids     = df.index.to_numpy()
+    if group_values is not None:
+        group_values = group_values.reindex(df.index)
     X            = df[pp_cols].to_numpy(dtype=np.float32)
     Y            = df[f_cols].to_numpy(dtype=np.float32)
     strat_labels = df[mat_col].to_numpy() if mat_col else None
@@ -410,7 +430,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         print(f"  {fc}  mean={Y[:, i].mean():.4f}  std={Y[:, i].std():.4f}  "
               f"min={Y[:, i].min():.4f}  max={Y[:, i].max():.4f}")
 
-    return part_ids, X, Y, pp_cols, f_cols, strat_labels
+    group_ids = group_values.to_numpy() if group_values is not None else None
+    return part_ids, X, Y, pp_cols, f_cols, strat_labels, group_ids
 
 
 def load_m1_data_processing(m1_dir: Path, part_ids: np.ndarray):
@@ -456,7 +477,7 @@ def load_m1_data_processing(m1_dir: Path, part_ids: np.ndarray):
 
 def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
            device: torch.device, seed: int, strat_labels=None,
-           precomputed_splits=None):
+           precomputed_splits=None, group_values=None, group_cfg=None):
     """Run K-fold Cross Validation; return metrics DataFrame and best-fold artefacts.
 
     When precomputed_splits is provided (list of dicts with keys tr_idx, val_idx,
@@ -472,7 +493,10 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
         print(f"Using {K} precomputed M1 splits for final CV")
     else:
         K = train_cfg["k_folds"]
-        if strat_labels is not None:
+        if grouping_enabled(group_cfg):
+            outer = grouped_kfold(np.arange(len(X)), K, seed,
+                                  group_values, group_cfg, strat_labels)
+        elif strat_labels is not None:
             kf    = StratifiedKFold(n_splits=K, shuffle=True, random_state=seed)
             outer = list(kf.split(X, strat_labels))
         else:
@@ -480,7 +504,11 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
             outer = list(kf.split(X))
         fold_triples = []
         for fold_n, (tv_idx, test_idx) in enumerate(outer):
-            if strat_labels is not None:
+            if grouping_enabled(group_cfg):
+                tr_idx, val_idx = grouped_train_val_split(
+                    tv_idx, train_cfg["val_fraction"], seed + fold_n,
+                    group_values, group_cfg, strat_labels)
+            elif strat_labels is not None:
                 sss = StratifiedShuffleSplit(n_splits=1,
                                             test_size=train_cfg["val_fraction"],
                                             random_state=seed + fold_n)
@@ -494,6 +522,11 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
                 val_idx = tv_idx[perm[:n_val]]
                 tr_idx  = tv_idx[perm[n_val:]]
             fold_triples.append((tr_idx, val_idx, test_idx))
+
+    if grouping_enabled(group_cfg) and group_values is not None:
+        for tr_idx, val_idx, test_idx in fold_triples:
+            validate_group_disjoint(tr_idx, val_idx, test_idx,
+                                    group_values=group_values, config=group_cfg)
 
     n_in  = X.shape[1]
     n_out = Y.shape[1]
@@ -705,7 +738,8 @@ def save_predictions(model: M2Model, X: np.ndarray,
 
 def final_train_m2(X, Y, tr_idx: np.ndarray, val_idx: np.ndarray,
                    x_sc: MinMaxScaler, model_cfg: dict, train_cfg: dict,
-                   seed: int, device: torch.device):
+                   seed: int, device: torch.device, group_values=None,
+                   group_cfg=None):
     """Train the final M2Model using M1's exact train/val split boundaries.
 
     x_sc is M1's pre-fitted pp_sc (passed in, not re-fitted here).
@@ -718,11 +752,16 @@ def final_train_m2(X, Y, tr_idx: np.ndarray, val_idx: np.ndarray,
 
     # Backward-compat: if val_idx is empty, carve it from tr_idx
     if len(val_idx) == 0:
-        rng     = np.random.default_rng(seed)
-        perm    = rng.permutation(len(tr_idx))
-        n_val   = max(1, int(len(tr_idx) * train_cfg["val_fraction"]))
-        val_idx = tr_idx[perm[:n_val]]
-        tr_idx  = tr_idx[perm[n_val:]]
+        if grouping_enabled(group_cfg):
+            tr_idx, val_idx = grouped_train_val_split(
+                tr_idx, train_cfg["val_fraction"], seed, group_values,
+                group_cfg)
+        else:
+            rng     = np.random.default_rng(seed)
+            perm    = rng.permutation(len(tr_idx))
+            n_val   = max(1, int(len(tr_idx) * train_cfg["val_fraction"]))
+            val_idx = tr_idx[perm[:n_val]]
+            tr_idx  = tr_idx[perm[n_val:]]
         print(f"  [fallback] Internal val split created from tr_idx "
               f"(train={len(tr_idx)}  val={len(val_idx)})")
 
@@ -798,7 +837,8 @@ def suggest_hyperparams(trial, ss: dict, n_in: int):
 
 
 def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
-                     f_cols, seed, device, strat_labels=None):
+                     f_cols, seed, device, strat_labels=None,
+                     group_values=None, group_cfg=None):
     """Optuna objective: mini K-fold CV; returns mean test mean_MAE (minimise)."""
     ss      = optuna_cfg["search_space"]
     n_folds = optuna_cfg["n_folds"]
@@ -816,7 +856,10 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
         "k_folds":     n_folds,
     }
 
-    if strat_labels is not None:
+    if grouping_enabled(group_cfg):
+        split_iter = grouped_kfold(np.arange(len(Y)), n_folds, seed,
+                                   group_values, group_cfg, strat_labels)
+    elif strat_labels is not None:
         kf         = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
         split_iter = list(kf.split(X, strat_labels))
     else:
@@ -825,7 +868,11 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
 
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(split_iter):
-        if strat_labels is not None:
+        if grouping_enabled(group_cfg):
+            tr_idx, val_idx = grouped_train_val_split(
+                tv_idx, base_train_cfg["val_fraction"], seed + fold,
+                group_values, group_cfg, strat_labels)
+        elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
                                         test_size=base_train_cfg["val_fraction"],
                                         random_state=seed + fold)
@@ -858,7 +905,8 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
 
 
 def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
-            f_cols, seed, device, strat_labels=None, out_dir=None):
+            f_cols, seed, device, strat_labels=None, out_dir=None,
+            group_values=None, group_cfg=None):
     """Create Optuna study (TPE sampler + HyperbandPruner), run HPO, return study."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -893,7 +941,7 @@ def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
     study.optimize(
         lambda t: optuna_objective(
             t, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
-            f_cols, seed, device, strat_labels),
+            f_cols, seed, device, strat_labels, group_values, group_cfg),
         n_trials=n_trials,
         show_progress_bar=True,
     )
@@ -968,7 +1016,9 @@ def main():
     for d in [out_dir, run_best_dir, overall_best_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    part_ids, X, Y, pp_cols, f_cols, strat_labels = load_data(data_cfg, prep_cfg)
+    (part_ids, X, Y, pp_cols, f_cols,
+     strat_labels, group_ids) = load_data(data_cfg, prep_cfg)
+    group_cfg = data_cfg.get("group_split", {})
     n_in, n_out = X.shape[1], Y.shape[1]
 
     # ── Initial train/test split ──────────────────────────────────────────────
@@ -981,10 +1031,15 @@ def main():
         print(f"[warn] No M1 split files found in {m1_best_dir} — "
               f"generating a fresh independent split.")
         test_frac = prep_cfg.get("test_fraction", 0.2)
-        dev_idx_gen, test_idx = _initial_split(len(part_ids), test_frac, seed, strat_labels)
+        dev_idx_gen, test_idx = _initial_split(
+            len(part_ids), test_frac, seed, strat_labels, group_ids, group_cfg)
         tr_idx, val_idx, m1_pp_sc, m1_run_ts = dev_idx_gen, np.array([], dtype=np.intp), None, None
 
     dev_idx   = np.concatenate([tr_idx, val_idx]) if len(val_idx) > 0 else tr_idx
+    if grouping_enabled(group_cfg) and group_ids is not None:
+        validate_group_disjoint(tr_idx, val_idx, test_idx,
+                                group_values=group_ids, config=group_cfg)
+        validate_protected_excluded(test_idx, group_ids, group_cfg)
     dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
     print(f"Data split  →  train={len(tr_idx)}  val={len(val_idx)}  "
           f"test={len(test_idx)}  dev={len(dev_idx)}")
@@ -1009,7 +1064,9 @@ def main():
         if "optuna" not in cfg:
             raise ValueError("mode='optuna' but no 'optuna' section found in config.")
         study = run_hpo(X[dev_idx], Y[dev_idx], cfg["optuna"], model_cfg, train_cfg,
-                        f_cols, seed, device, dev_strat, run_best_dir)
+                        f_cols, seed, device, dev_strat, run_best_dir,
+                        group_ids[dev_idx] if group_ids is not None else None,
+                        group_cfg)
         model_cfg, train_cfg = best_cfg_from_study(
             study, cfg["optuna"], model_cfg, train_cfg, n_in)
         best_hpo = {
@@ -1031,7 +1088,9 @@ def main():
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
     metrics_df, best_fold_idx, best_fold_mae, _, _, _, _ = run_cv(
         X[dev_idx], Y[dev_idx], model_cfg, train_cfg,
-        f_cols, device, seed, dev_strat)
+        f_cols, device, seed, dev_strat,
+        group_values=group_ids[dev_idx] if group_ids is not None else None,
+        group_cfg=group_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
@@ -1042,7 +1101,8 @@ def main():
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
     final_model, y_sc = final_train_m2(
-        X, Y, tr_idx, val_idx, x_sc, model_cfg, train_cfg, seed, device)
+        X, Y, tr_idx, val_idx, x_sc, model_cfg, train_cfg, seed, device,
+        group_ids, group_cfg)
 
     X_te_s = x_sc.transform(X[test_idx]).astype(np.float32)
     final_metrics = evaluate_model(final_model, X_te_s, Y[test_idx], y_sc, f_cols, device)

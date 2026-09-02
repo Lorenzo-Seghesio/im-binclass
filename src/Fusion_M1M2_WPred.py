@@ -80,6 +80,14 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    from Utility.group_splitting import (
+        grouping_enabled, validate_group_disjoint, validate_protected_excluded,
+    )
+except ModuleNotFoundError:  # package-style import from the repository root
+    from src.Utility.group_splitting import (
+        grouping_enabled, validate_group_disjoint, validate_protected_excluded,
+    )
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -518,8 +526,10 @@ def load_scalar_data(material: str, cfg: dict):
     id_col = data_cfg["id_col"]
     target_col = data_cfg["target_col"]
     df = pd.read_csv(csv_path, index_col=id_col)
+    group_col = data_cfg.get("group_col")
+    group_values = df[group_col].copy() if group_col in df else None
     df = df.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
-    pp_cols = [c for c in df.columns if c != target_col]
+    pp_cols = [c for c in df.columns if c != target_col and c != group_col]
 
     # impute pp columns
     for col in pp_cols:
@@ -527,7 +537,7 @@ def load_scalar_data(material: str, cfg: dict):
             df[col] = df[col].fillna(df[col].median())
 
     print(f"  Loaded {len(df)} parts from {csv_path.name}")
-    return df, pp_cols, target_col
+    return df, pp_cols, target_col, group_values
 
 
 def load_train_test_split(m1_dir: Path):
@@ -1569,7 +1579,7 @@ def main():
     # Load X-clean scalar data (X-outliers pre-removed by clean_data.py).
     # y-filter is applied after the split is loaded (Step 2) using M1's
     # data_processing.json so Fusion uses the exact same parts as M1.
-    df_scalar, pp_cols, target_col = load_scalar_data(MAT, cfg)
+    df_scalar, pp_cols, target_col, group_values = load_scalar_data(MAT, cfg)
     n_pp = len(pp_cols)
 
     # Peek at M1 data_processing.json early to extract y_filter params
@@ -1585,6 +1595,7 @@ def main():
                   f"{len(_removed_y_ids)} parts to remove → {sorted(_removed_y_ids)}")
     if _pp_cols_from_m1:
         pp_cols = [c for c in _pp_cols_from_m1 if c in df_scalar.columns]
+        n_pp = len(pp_cols)
         print(f"  Reusing pp_cols from M1 data_processing ({len(pp_cols)} features)")
 
     # M1-scope: same parts M1 used (clean CSV minus y-removed parts)
@@ -1614,6 +1625,13 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     print("\n── Step 2: Loading train/test split ────────────────────────")
     dev_idx_m1, test_idx_m1, m1_pp_sc, m1_run_ts = load_m1_data_for_fusion(m1_dir, part_ids_m1)
+    group_cfg = cfg.get("data", {}).get("group_split", {})
+    if grouping_enabled(group_cfg) and group_values is not None:
+        m1_groups = group_values.reindex(part_ids_m1).to_numpy()
+        validate_group_disjoint(dev_idx_m1, test_idx_m1,
+                                group_values=m1_groups, config=group_cfg)
+        validate_protected_excluded(test_idx_m1, m1_groups, group_cfg)
+        print("  Group integrity verified for M1 dev/test split")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 3 — Load models
