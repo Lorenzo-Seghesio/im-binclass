@@ -55,12 +55,14 @@ try:
         grouped_train_val_split, validate_group_disjoint,
         validate_protected_excluded,
     )
+    from Utility.optuna_seeding import resolve_optuna_seed
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouping_enabled, grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, validate_group_disjoint,
         validate_protected_excluded,
     )
+    from src.Utility.optuna_seeding import resolve_optuna_seed
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -602,12 +604,15 @@ def _copy_artefacts(run_best_dir: Path, overall_best_dir: Path):
 
 # ── XAI helpers ───────────────────────────────────────────────────────────────
 
-def _save_run_info(rb_dir: Path, ob_dir: Path, mat: str, label: str, updated: bool):
+def _save_run_info(rb_dir: Path, ob_dir: Path, mat: str, label: str,
+                    updated: bool, split_seed: int, sampler_seed: int):
     """Write run_info.json to run_best and (if overall best) to best_overall."""
     info = {
         "run_ts":       _RUN_TS,
         "material":     mat,
         "model":        label,
+        "split_seed":   split_seed,
+        "sampler_seed": sampler_seed,
         "run_best_dir": str(rb_dir.relative_to(BASE_DIR)),
     }
     (rb_dir / "run_info.json").write_text(json.dumps(info, indent=2))
@@ -1227,9 +1232,10 @@ def _obj_gbdt(trial, X_pp, y, hpo_cfg, model_class, suggest_fn, seed, strat_labe
 
 
 def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed,
-             pruner_type="hyperband", n_folds=3) -> optuna.Study:
+             pruner_type="hyperband", n_folds=3, sampler_seed=None) -> optuna.Study:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=seed)
+    sampler = optuna.samplers.TPESampler(
+        n_startup_trials=n_startup_trials, seed=sampler_seed)
     if pruner_type == "hyperband":
         pruner = optuna.pruners.HyperbandPruner(
             min_resource=1, max_resource=n_folds, reduction_factor=3)
@@ -1241,7 +1247,8 @@ def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed
     print(f"\n{'═' * 60}")
     print(f"Optuna HPO  |  study: {study_name}")
     print(f"  Trials: {n_trials}  (startup RS: {n_startup_trials})")
-    print(f"  Folds: {n_folds}  |  Sampler: TPE  |  Pruner: {pruner_type}")
+    print(f"  Folds: {n_folds}  |  Sampler: TPE (seed={sampler_seed})  |  "
+          f"Pruner: {pruner_type}")
     print(f"{'═' * 60}")
     study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
 
@@ -1266,6 +1273,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 group_values=None, group_cfg=None, fixed_train_idx=None,
                 fixed_val_idx=None):
     hpo_cfg   = cfg["encoder_hpo"]
+    sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
     rb_dir    = BASE_OUT / "Encoder" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "Encoder" / mat_dir / "best_overall"
@@ -1286,7 +1294,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                                             group_values[dev_idx] if group_values is not None else None,
                                             group_cfg),
         out_dir=rb_dir, seed=seed,
-        pruner_type="hyperband", n_folds=hpo_cfg["n_folds"])
+        pruner_type="hyperband", n_folds=hpo_cfg["n_folds"],
+        sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
     mcfg_u, tcfg_u = suggest_encoder_params(fixed, hpo_cfg["search_space"])
@@ -1299,6 +1308,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     dropout      = mcfg_u.get("dropout",       train_cfg.get("dropout", 0.2))
 
     hpo_info = {"trial": study.best_trial.number, "hpo_mae": float(study.best_trial.value),
+                "sampler_seed": sampler_seed,
                 "channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
                 "head_hidden": head_hidden, "dropout": dropout, **tcfg_u}
     (rb_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
@@ -1339,7 +1349,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     # XAI — GradCAM on the last Conv1d layer
     _xai_gradcam_encoder(final_model, scale(X_pt[test_idx]), rb_dir, "Encoder", device)
 
-    _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated)
+    _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
@@ -1352,6 +1362,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
             group_values=None, group_cfg=None, fixed_train_idx=None,
             fixed_val_idx=None):
     hpo_cfg   = cfg["mlp_hpo"]
+    sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
     rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "MLP" / mat_dir / "best_overall"
@@ -1373,7 +1384,8 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
                                         group_values[dev_idx] if group_values is not None else None,
                                         group_cfg),
         out_dir=rb_dir, seed=seed,
-        pruner_type="hyperband", n_folds=hpo_cfg["n_folds"])
+        pruner_type="hyperband", n_folds=hpo_cfg["n_folds"],
+        sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
     mcfg_u, tcfg_u = suggest_mlp_params(fixed, hpo_cfg["search_space"])
@@ -1383,6 +1395,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     dropout     = mcfg_u.get("dropout",     train_cfg.get("dropout", 0.2))
 
     hpo_info = {"trial": study.best_trial.number, "hpo_mae": float(study.best_trial.value),
+                "sampler_seed": sampler_seed,
                 "hidden_dims": hidden_dims, "dropout": dropout, **tcfg_u}
     (rb_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
 
@@ -1423,7 +1436,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     _xai_shap_mlp(final_model, X_dev_sc, X_te_s, pp_cols, rb_dir, "MLP", device)
     _xai_ig_mlp(final_model, X_te_s, X_dev_sc, pp_cols, rb_dir, "MLP", device)
 
-    _save_run_info(rb_dir, ob_dir, mat, "MLP", updated)
+    _save_run_info(rb_dir, ob_dir, mat, "MLP", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "MLP")
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
@@ -1435,6 +1448,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
              dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
              group_values=None, group_cfg=None):
     hpo_cfg   = cfg["lgbm_hpo"]
+    sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "LightGBM" / mat_dir / "best_overall"
@@ -1456,12 +1470,14 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                          group_values[dev_idx] if group_values is not None else None,
                                          group_cfg),
         out_dir=rb_dir, seed=seed,
-        pruner_type="median", n_folds=hpo_cfg["n_folds"])
+        pruner_type="median", n_folds=hpo_cfg["n_folds"],
+        sampler_seed=sampler_seed)
 
     fixed       = optuna.trial.FixedTrial(study.best_trial.params)
     best_params = suggest_lgbm_params(fixed, hpo_cfg["search_space"])
     hpo_info    = {"trial": study.best_trial.number,
                    "hpo_mae": float(study.best_trial.value),
+                   "sampler_seed": sampler_seed,
                    "best_params": best_params}
     (rb_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
 
@@ -1497,7 +1513,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
     _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "LightGBM")
 
-    _save_run_info(rb_dir, ob_dir, mat, "LightGBM", updated)
+    _save_run_info(rb_dir, ob_dir, mat, "LightGBM", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "LightGBM")
         save_cv_plots(metrics_df, K, mat, ob_dir, "LightGBM")
@@ -1509,6 +1525,7 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
                 group_values=None, group_cfg=None):
     hpo_cfg   = cfg["xgboost_hpo"]
+    sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
     rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best" / _RUN_TS
     ob_dir    = BASE_OUT / "XGBoost" / mat_dir / "best_overall"
@@ -1530,12 +1547,14 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                          group_values[dev_idx] if group_values is not None else None,
                                          group_cfg),
         out_dir=rb_dir, seed=seed,
-        pruner_type="median", n_folds=hpo_cfg["n_folds"])
+        pruner_type="median", n_folds=hpo_cfg["n_folds"],
+        sampler_seed=sampler_seed)
 
     fixed       = optuna.trial.FixedTrial(study.best_trial.params)
     best_params = suggest_xgb_params(fixed, hpo_cfg["search_space"])
     hpo_info    = {"trial": study.best_trial.number,
                    "hpo_mae": float(study.best_trial.value),
+                   "sampler_seed": sampler_seed,
                    "best_params": best_params}
     (rb_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
 
@@ -1571,7 +1590,7 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
     _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "XGBoost")
 
-    _save_run_info(rb_dir, ob_dir, mat, "XGBoost", updated)
+    _save_run_info(rb_dir, ob_dir, mat, "XGBoost", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "XGBoost")
         save_cv_plots(metrics_df, K, mat, ob_dir, "XGBoost")
@@ -1589,11 +1608,18 @@ def main():
                         choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help="Material subset: PP | ABS (plain KFold) or ALL (stratified). "
                              "Case-insensitive.")
+    parser.add_argument("--optuna-seed", type=int, default=None,
+                        help="Optuna sampler seed for all reference studies; omit to generate fresh seeds.")
     args = parser.parse_args()
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
     cfg      = json.loads(cfg_path.read_text())
+    if args.optuna_seed is not None:
+        for model_name in ("encoder_hpo", "mlp_hpo", "lgbm_hpo", "xgboost_hpo"):
+            if model_name in cfg:
+                cfg[model_name]["sampler_seed"] = args.optuna_seed
+        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed} for active reference studies")
     mat_dir  = _MAT_DIR[mat]
     BASE_OUT = BASE_DIR / cfg.get("output_base_dir", "outputs/ProBayes/RefModels")
 

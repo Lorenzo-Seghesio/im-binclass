@@ -20,6 +20,10 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+try:
+    from Utility.optuna_seeding import resolve_optuna_seed
+except ModuleNotFoundError:
+    from src.Utility.optuna_seeding import resolve_optuna_seed
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 
@@ -687,6 +691,8 @@ if __name__ == "__main__":
                         choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2',
                                  'pp_1', 'pp_2', 'abs_1', 'abs_2'])
     parser.add_argument('--opt_metric', type=str, choices=VALID_OPT_METRICS)
+    parser.add_argument('--optuna-seed', type=int, default=None,
+                        help='Optuna sampler seed; omit to generate a fresh seed.')
     parser.add_argument('--data_analysis', action='store_true',
                         help='Generate and save data analysis plots (weight distribution, '
                              'feature correlations, feature-vs-weight scatters).')
@@ -701,6 +707,9 @@ if __name__ == "__main__":
     if args.opt_metric:
         cfg['opt_metric'] = args.opt_metric
         print(f"\n[CLI override] opt_metric set to '{args.opt_metric}'")
+    if args.optuna_seed is not None:
+        cfg.setdefault('optuna_trials', {})['sampler_seed'] = args.optuna_seed
+        print(f"\n[CLI override] Optuna sampler seed set to {args.optuna_seed}")
 
     print(f"Optimization metric: {cfg.get('opt_metric', 'mae').upper()}")
 
@@ -734,12 +743,13 @@ if __name__ == "__main__":
                                       data_analysis=args.data_analysis)
 
     optuna_trials    = cfg.get('optuna_trials', {})
+    sampler_seed     = resolve_optuna_seed(optuna_trials)
     n_startup_trials = optuna_trials.get('startup_trials', 10)
     n_trials         = optuna_trials.get('tot_trials', 50)
     print(f"\nStarting TPE optimization ({n_trials} trials, {n_startup_trials} startup RS)...\n")
 
     #optuna.logging.set_verbosity(optuna.logging.WARNING)
-    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42)
+    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=sampler_seed)
     pruner  = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
     best_trial_tpe = run_optimization(sampler, pruner, train_csv_path,
                                       n_trials=n_trials, n_startup_trials=n_startup_trials,
@@ -752,5 +762,15 @@ if __name__ == "__main__":
         csv_path_test=test_csv_path,
         hparam_cfg=cfg,
     )
+
+    run_info = {
+        'run_ts': datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+        'dataset': dataset,
+        'split_seed': 42,
+        'sampler_seed': sampler_seed,
+        'config': str(Path(args.config).resolve()),
+    }
+    (OUT_DIR / 'run_info.json').write_text(json.dumps(run_info, indent=4))
+    print(f"Optuna run info saved to {OUT_DIR / 'run_info.json'}")
 
     print(f"\nTotal time: {time.time() - start_time:.2f} seconds")

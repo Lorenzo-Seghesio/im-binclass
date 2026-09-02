@@ -117,12 +117,14 @@ try:
         grouped_train_val_split, group_assignments, validate_group_disjoint,
         validate_protected_excluded,
     )
+    from Utility.optuna_seeding import resolve_optuna_seed
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouping_enabled, grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, group_assignments, validate_group_disjoint,
         validate_protected_excluded,
     )
+    from src.Utility.optuna_seeding import resolve_optuna_seed
 
 warnings.filterwarnings("ignore")
 
@@ -1035,12 +1037,12 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
 
 def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
             seed, device, strat_labels=None, out_dir=None,
-            group_values=None, group_cfg=None):
+            group_values=None, group_cfg=None, sampler_seed=None):
     """Create Optuna study (TPE sampler + HyperbandPruner), run HPO, return study."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     sampler = optuna.samplers.TPESampler(
-        n_startup_trials=optuna_cfg["n_startup_trials"], seed=seed)
+        n_startup_trials=optuna_cfg["n_startup_trials"], seed=sampler_seed)
     pruner = optuna.pruners.HyperbandPruner(
         min_resource=optuna_cfg.get("hyperband_min_resource", 1),
         max_resource=optuna_cfg["n_folds"],
@@ -1064,7 +1066,7 @@ def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
     print(f"  Folds  : {optuna_cfg['n_folds']}  |  "
           f"Epochs : {optuna_cfg['epochs']}  |  "
           f"Patience : {optuna_cfg['patience']}")
-    print(f"  Sampler: TPE     Pruner: Hyperband")
+    print(f"  Sampler: TPE (seed={sampler_seed})     Pruner: Hyperband")
     print(f"{'═' * 60}")
 
     study.optimize(
@@ -1120,11 +1122,16 @@ def main():
                         help=("Material subset: PP or ABS (plain KFold) "
                               "or ALL for full dataset (stratified KFold). "
                               "Case-insensitive."))
+    parser.add_argument("--optuna-seed", type=int, default=None,
+                        help="Optuna sampler seed; omit to generate a fresh seed.")
     args = parser.parse_args()
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
     cfg      = json.loads(cfg_path.read_text())
+    if args.optuna_seed is not None:
+        cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
+        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
 
     data_cfg  = cfg["data"]
     prep_cfg  = cfg["preprocessing"]
@@ -1167,21 +1174,24 @@ def main():
     # ── Mode selection / HPO (dev data only) ─────────────────────────────────
     mode     = cfg.get("mode", "manual").lower()
     best_hpo = None
+    sampler_seed = None
     print(f"Mode     : {mode}")
 
     if mode == "optuna":
         if "optuna" not in cfg:
             raise ValueError("mode='optuna' but no 'optuna' section found in config.")
+        sampler_seed = resolve_optuna_seed(cfg["optuna"])
         study = run_hpo(X_pp[dev_idx], [x[dev_idx] for x in X_pt_list], y[dev_idx],
                         cfg["optuna"], model_cfg, train_cfg,
                         seed, device, dev_strat, run_best_dir,
                         group_ids[dev_idx] if group_ids is not None else None,
-                        group_cfg)
+                        group_cfg, sampler_seed)
         model_cfg, train_cfg = best_cfg_from_study(
             study, cfg["optuna"], model_cfg, train_cfg, n_pp)
         best_hpo = {
             "trial":              study.best_trial.number,
             "hpo_mean_mae":       float(study.best_trial.value),
+            "sampler_seed":       sampler_seed,
             "model_cfg":          model_cfg,
             "train_lr":           train_cfg["lr"],
             "train_weight_decay": train_cfg["weight_decay"],
@@ -1283,6 +1293,8 @@ def main():
     run_info = {
         "run_ts":       _RUN_TS,
         "material":     mat,
+        "split_seed":   seed,
+        "sampler_seed": sampler_seed,
         "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
     }
     (run_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))

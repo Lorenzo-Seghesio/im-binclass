@@ -22,6 +22,10 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+try:
+    from Utility.optuna_seeding import resolve_optuna_seed
+except ModuleNotFoundError:
+    from src.Utility.optuna_seeding import resolve_optuna_seed
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from any subfolder)
 
@@ -1266,6 +1270,8 @@ if __name__ == "__main__":
                         help="Dataset to use: pp (both 1 and 2 cavities), abs (both 1 and 2 cavities), pp_1, pp_2, abs_1, abs_2. Overrides the value in the config file.")
     parser.add_argument('--opt_metric', type=str, choices=['mae', 'rmse', 'r2', 'mape', 'max_error'],
                         help="Metric to optimize: mae, rmse, r2, mape, or max_error. Overrides the value in the config file.")
+    parser.add_argument('--optuna-seed', type=int, default=None,
+                        help='Optuna sampler seed; omit to generate a fresh seed.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -1280,6 +1286,9 @@ if __name__ == "__main__":
     if args.opt_metric:
         cfg['opt_metric'] = args.opt_metric
         print(f"\n[CLI override] optimization metric")
+    if args.optuna_seed is not None:
+        cfg.setdefault('optuna_trials', {})['sampler_seed'] = args.optuna_seed
+        print(f"\n[CLI override] Optuna sampler seed set to {args.optuna_seed}")
     print(f"\nOptimization metric: {cfg['opt_metric'].upper()}")
 
     dataset = cfg.get('dataset', 'ABS').upper()
@@ -1353,15 +1362,26 @@ if __name__ == "__main__":
     # Run HPO otpimization with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
     optuna_trials = cfg.get('optuna_trials', {})
+    sampler_seed = resolve_optuna_seed(optuna_trials)
     n_startup_trials = optuna_trials.get('startup_trials', 10)
     n_trials = optuna_trials.get('tot_trials', 100)
     print(f"Total Optuna trials: {n_trials} (with {n_startup_trials} startup trials for RS)")
-    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
+    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=sampler_seed)
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
     best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials, hparam_cfg=cfg)
 
     # Retrain the best models
     train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path, hparam_cfg=cfg)
+
+    run_info = {
+        'run_ts': datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+        'dataset': dataset,
+        'split_seed': 42,
+        'sampler_seed': sampler_seed,
+        'config': str(Path(args.config).resolve()),
+    }
+    (OUT_DIR / 'run_info.json').write_text(json.dumps(run_info, indent=4))
+    print(f"Optuna run info saved to {OUT_DIR / 'run_info.json'}")
 
     # Print total time taken
     end_time = time.time()
